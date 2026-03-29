@@ -15,7 +15,7 @@
 
 IMAGE        := "localhost/nix-usernetes-node:1.33.10"
 CONTAINER    := "u7s"
-HOST_IP      := `ip --json route get 1 | jq -r '.[0].prefsrc'`
+HOST_IP      := `ip -4 route show default | grep -v 'wg\|tun\|vpn\|utun' | head -1 | grep -oP 'src [\d.]+' | awk '{print $2}'`
 NODE_NAME    := "u7s-node"
 POD_SUBNET   := "10.244.0.0/16"
 SVC_SUBNET   := "10.96.0.0/16"
