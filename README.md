@@ -1,6 +1,6 @@
 # nix-usernetes
 
-A Nix-native, rootless, single-node Kubernetes cluster for NixOS developer workstations.
+A Nix-native, rootless, single-node Kubernetes cluster for NixOS developer workstations, inspired by usernetes.
 
 Built as a replacement for [`kindest/node`](https://github.com/rootless-containers/usernetes) that works on systems where every filesystem is f2fs — which the upstream cAdvisor vendored in `kindest/node` does not support.
 
