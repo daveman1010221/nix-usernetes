@@ -1,192 +1,133 @@
-# Usernetes: Kubernetes without the root privileges (Generation 2)
+# nix-usernetes
 
-Usernetes (Gen2) deploys a Kubernetes cluster inside [Rootless Docker](https://rootlesscontaine.rs/getting-started/docker/),
-so as to mitigate potential container-breakout vulnerabilities.
+A Nix-native, rootless, single-node Kubernetes cluster for NixOS developer workstations.
 
-> [!NOTE]
->
-> Usernetes (Gen2) has *significantly* diverged from the original Usernetes (Gen1),
-> which did not require Rootless Docker to be installed on hosts.
->
-> See the [`gen1`](https://github.com/rootless-containers/usernetes/tree/gen1) branch for
-> the original Usernetes (Gen1).
+Built as a replacement for [`kindest/node`](https://github.com/rootless-containers/usernetes) that works on systems where every filesystem is f2fs — which the upstream cAdvisor vendored in `kindest/node` does not support.
 
-Usernetes (Gen2) is similar to [Rootless `kind`](https://kind.sigs.k8s.io/docs/user/rootless/) and [Rootless minikube](https://minikube.sigs.k8s.io/docs/drivers/docker/),
-but Usernetes (Gen 2) supports creating a cluster with multiple hosts.
+## Why this exists
 
-## Components
-- Cluster configuration: kubeadm
-- CRI: containerd
-- OCI: runc
-- CNI: Flannel
+The upstream `kindest/node` embeds a kubelet whose vendored cAdvisor hardcodes a `supportedFsType` map that does not include `f2fs`. On a NixOS host with full-disk LUKS+LVM+f2fs encryption, kubelet crashes immediately:
+
+```
+failed to get rootfs info: failed to get mount point for device
+"/dev/mapper/nix-home": no partition info for device
+```
+
+The fix is a one-line change (`"f2fs": true`) that hasn't propagated into any upstream release. Rather than wait, this project builds all Kubernetes components from source in Nix with the patch applied.
+
+## What it builds
+
+A layered OCI container image containing:
+
+- **kubelet, kube-apiserver, kube-controller-manager, kube-scheduler, kubectl, kube-proxy** — built from source at K8s 1.33.10
+- **Patched cAdvisor** — vendored into kubelet via source tree injection; fork at [`daveman1010221/cadvisor@v0.52.2-f2fs`](https://github.com/daveman1010221/cadvisor/tree/fix-f2fs-v0.52.1)
+- **etcd** — from nixpkgs, run as a native systemd unit
+- **containerd, runc, cri-tools, cni-plugins** — from nixpkgs
+- **systemd as PID 1** — required for proper cgroup management inside the container
+
+All control plane components (etcd, kube-apiserver, kube-controller-manager, kube-scheduler) run as **native systemd units** using the Nix-built binaries already in the image. No container image pulls, no pause images, no in-cluster CNI required for the control plane.
 
 ## Requirements
 
-- One of the following host operating system:
+- NixOS (tested on 26.05)
+- Podman 5.x
+- `just`
+- `nix` with flakes enabled
 
-|Host operating system|Minimum version|
-|---------------------|---------------|
-|Ubuntu (recommended) |22.04          |
-|Rocky Linux          |9              |
-|AlmaLinux            |9              |
-|Fedora               |(?)            |
+## Quickstart
 
-- One of the following container engines:
-
-|Container Engine                                                                    |Minimum version|
-|------------------------------------------------------------------------------------|---------------|
-|[Rootless Docker](https://rootlesscontaine.rs/getting-started/docker/) (recommended)|v20.10         |
-|[Rootless Podman](https://rootlesscontaine.rs/getting-started/podman/)              |v4.x           |
-|[Rootless nerdctl](https://rootlesscontaine.rs/getting-started/containerd/)         |v1.6           |
+### First time
 
 ```bash
-curl -o install.sh -fsSL https://get.docker.com
-sudo sh install.sh
-dockerd-rootless-setuptool.sh install
-```
+# Build the image
+nix build .#node-image -o result-node-image
 
-- systemd lingering:
-```bash
-sudo loginctl enable-linger $(whoami)
-```
+# Load into podman
+podman load < result-node-image
 
-- cgroup v2 delegation:
-```bash
-sudo mkdir -p /etc/systemd/system/user@.service.d
-
-sudo tee /etc/systemd/system/user@.service.d/delegate.conf <<EOF >/dev/null
-[Service]
-Delegate=cpu cpuset io memory pids
-EOF
-
-sudo systemctl daemon-reload
-```
-
-- Kernel modules:
-```
-sudo tee /etc/modules-load.d/usernetes.conf <<EOF >/dev/null
-br_netfilter
-vxlan
-EOF
-
-sudo systemctl restart systemd-modules-load.service
-```
-
-- sysctl:
-```
-sudo tee /etc/sysctl.d/99-usernetes.conf <<EOF >/dev/null
-net.ipv4.conf.default.rp_filter = 2
-EOF
-
-sudo sysctl --system
-```
-
-- slirp4netns, not Pasta:
-```
-# Podman v5 (or later) users have to change the network mode from pasta to slirp4netns.
-# This step is not needed for Docker, nerdctl, and Podman v4.
-
-mkdir -p "$HOME/.config/containers/containers.conf.d"
-cat <<EOF >"$HOME/.config/containers/containers.conf.d/slirp4netns.conf"
-[network]
-default_rootless_network_cmd="slirp4netns"
-EOF
-```
-<!--
-pasta does not seem to work well
-
-> 2024-12-02T17:15:40.070018488Z stderr F E1202 17:15:40.068621       1 main.go:228] Failed to create SubnetManager:
-> error retrieving pod spec for 'kube-flannel/kube-flannel-ds-ms2d9': Get "https://10.96.0.1:443/api/v1/namespaces/kube-flannel/pods/kube-flannel-ds-ms2d9":
-> dial tcp 10.96.0.1:443: i/o timeout
--->
-
-Use scripts in [`./init-host`](./init-host) for automating these steps.
-
-## Usage
-See `make help`.
-
-```bash
-# Bootstrap a cluster
-make up
-make kubeadm-init
-make install-flannel
-
-# Enable kubectl
-make kubeconfig
+# Start and initialise the cluster
+just up
+just init
+just kubeconfig
 export KUBECONFIG=$(pwd)/kubeconfig
-kubectl get pods -A
 
-# Multi-host
-make join-command
-scp join-command another-host:~/usernetes
-ssh another-host make -C ~/usernetes up kubeadm-join
-make sync-external-ip
-
-# Debug
-make logs
-make shell
-make kubeadm-reset
-make down-v
-kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+# Verify
+kubectl get nodes
+kubectl cluster-info
 ```
 
-The container engine defaults to Docker.
-To change the container engine, set `export CONTAINER_ENGINE=podman` or `export CONTAINER_ENGINE=nerdctl`.
+### Subsequent starts
 
-### Customization
-
-The following environment variables are recognized:
-
-Name                  | Type    | Default value
-----------------------|---------|----------------------------------------------------------------
-`CONTAINER_ENGINE`    | String  | automatically resolved to "docker", "podman", or "nerdctl"
-`HOST_IP`             | String  | automatically resolved to the host's IP address
-`NODE_NAME`           | String  | "u7s-" + the host's hostname
-`NODE_SUBNET`         | String  | "10.100.%d.0/24" (%d is computed from the hash of the hostname)
-`PORT_ETCD`           | Integer | 2379
-`PORT_KUBELET`        | Integer | 10250
-`PORT_FLANNEL`        | Integer | 8472
-`PORT_KUBE_APISERVER` | Integer | 6443
-
-## Limitations
-- Node ports cannot be exposed automatically. Edit [`docker-compose.yaml`](./docker-compose.yaml) for exposing additional node ports.
-- Most of host files are not visible with `hostPath` mounts. Edit [`docker-compose.yaml`](./docker-compose.yaml) for mounting additional files.
-- Some [volume drivers](https://kubernetes.io/docs/concepts/storage/volumes/) such as `nfs` do not work.
-
-## Advanced topics
-### Network
-When `CONTAINER_ENGINE` is set to `nerdctl`, [bypass4netns](https://github.com/rootless-containers/bypass4netns) can be enabled for accelerating `connect(2)` syscalls.
-The acceleration currently does not apply to VXLAN packets.
+PKI and state persist in named podman volumes. No need to re-init:
 
 ```bash
-containerd-rootless-setuptool.sh install-bypass4netnsd
-export CONTAINER_ENGINE=nerdctl
-make up
+just up
+just kubeconfig
+export KUBECONFIG=$(pwd)/kubeconfig
+kubectl get nodes
 ```
 
-> [!NOTE]
->
-> The support for bypass4netns is still experimental
-
-### Multi-tenancy
-
-Multiple users on the hosts may create their own instances of Usernetes, but the port numbers have to be changed to avoid conflicts.
+### Tear down
 
 ```bash
-# Default: 2379
-export PORT_ETCD=12379
-# Default: 10250
-export PORT_KUBELET=20250
-# Default: 8472
-export PORT_FLANNEL=18472
-# Default: 6443
-export PORT_KUBE_APISERVER=16443
-
-make up
+just down        # stop container, preserve state volumes
+just reset       # stop container and wipe all state
 ```
 
-![docs/images/multi-tenancy.png](./docs/images/multi-tenancy.png)
+## Just targets
 
-### Rootful mode
-Although Usernetes (Gen2) is designed to be used with Rootless Docker, it should work with the regular "rootful" Docker too.
-This might be useful for some people who are looking for "multi-host" version of [`kind`](https://kind.sigs.k8s.io/) and [minikube](https://minikube.sigs.k8s.io/).
+| Target | Description |
+|--------|-------------|
+| `just up` | Start the node container |
+| `just down` | Stop the node container gracefully |
+| `just reset` | Stop and wipe all state (PKI, etcd data, kubelet state) |
+| `just init` | Generate PKI, kubeconfigs, start control plane services |
+| `just kubeconfig` | Extract admin kubeconfig to `./kubeconfig` |
+| `just shell` | Open a shell inside the node container |
+| `just logs` | Follow container logs |
+| `just status` | Show systemd unit status inside the container |
+
+## Architecture
+
+```
+flake.nix
+├── kubernetesPatched  (stdenv.mkDerivation)
+│   ├── src: kubernetes-v1.33.10.tar.gz
+│   ├── cadvisorPatchedSrc: daveman1010221/cadvisor@v0.52.2-f2fs
+│   ├── configurePhase: replaces vendor/github.com/google/cadvisor/
+│   └── buildPhase: go build -mod=vendor CGO_ENABLED=0
+│
+└── nodeImage  (dockerTools.buildLayeredImage)
+    ├── systemd as PID 1
+    ├── containerd + runc + cri-tools
+    ├── etcd (nixpkgs)
+    ├── kubernetesPatched binaries
+    └── systemd units for all control plane components
+```
+
+**Bootstrap flow (`just init`):**
+1. Generate PKI with openssl inside the container
+2. Write kubeconfigs for all components
+3. Patch the kube-apiserver unit with the host IP address
+4. `systemctl restart` all control plane services
+5. Wait for apiserver readiness
+6. Remove control-plane taint so workloads schedule
+
+## Patched cAdvisor
+
+K8s 1.33 vendors cAdvisor at `v0.52.1`. The patch adds `"f2fs": true` to the `supportedFsType` map in `fs/fs.go`. The patched fork is at [`daveman1010221/cadvisor`](https://github.com/daveman1010221/cadvisor), branch `fix-f2fs-v0.52.1`, tag `v0.52.2-f2fs`.
+
+The vendor injection keeps the declared version at `v0.52.1` in both `go.mod` and `vendor/modules.txt` — Go's `-mod=vendor` only validates version string consistency, not file content hashes.
+
+## Updating Kubernetes versions
+
+1. Update `k8sVersion` in `flake.nix`
+2. Run `./prefetch-hashes.sh` to get new SHA256 values
+3. Check the vendored cAdvisor version: `grep cadvisor go.mod`
+4. If changed, rebase the cAdvisor fork and update `cadvisorForkRev`
+
+## License
+
+MIT — see [LICENSE](LICENSE)
+
+Original usernetes project: https://github.com/rootless-containers/usernetes

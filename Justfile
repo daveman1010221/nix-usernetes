@@ -1,0 +1,287 @@
+# nix-usernetes Justfile
+# Single-node rootless Kubernetes for a developer workstation.
+# Start it when you need it. Stop it when you don't.
+#
+# Prerequisites: podman, just, openssl, jq
+#
+# Quickstart:
+#   just up       # start the container (systemd + containerd + kubelet)
+#   just init     # generate PKI and static pod manifests (first time only)
+#   just kubeconfig
+#   export KUBECONFIG=$(pwd)/kubeconfig
+#   kubectl get pods -A
+
+# ── configuration ─────────────────────────────────────────────────────────────
+
+IMAGE        := "localhost/nix-usernetes-node:1.33.10"
+CONTAINER    := "u7s"
+HOST_IP      := `ip --json route get 1 | jq -r '.[0].prefsrc'`
+NODE_NAME    := "u7s-node"
+POD_SUBNET   := "10.244.0.0/16"
+SVC_SUBNET   := "10.96.0.0/16"
+
+PORT_APISERVER := "6443"
+PORT_ETCD      := "2379"
+PORT_KUBELET   := "10250"
+
+# ── core lifecycle ────────────────────────────────────────────────────────────
+
+# Start the node container. Idempotent.
+up:
+    podman run -d \
+        --name {{CONTAINER}} \
+        --hostname {{NODE_NAME}} \
+        --privileged \
+        --network=host \
+        --cgroupns=private \
+        --ipc=host \
+        --systemd=always \
+        --security-opt seccomp=unconfined \
+        --security-opt apparmor=unconfined \
+        --tmpfs /run \
+        --tmpfs /run/lock \
+        --tmpfs /tmp \
+        --volume /run/booted-system/kernel-modules/lib/modules:/lib/modules:ro \
+        --volume u7s-pki:/etc/kubernetes \
+        --volume u7s-etcd:/var/lib/etcd \
+        --volume u7s-kubelet:/var/lib/kubelet \
+        --volume u7s-containerd:/var/lib/containerd \
+        --env container=docker \
+        --env HOST_IP={{HOST_IP}} \
+        --env NODE_NAME={{NODE_NAME}} \
+        --stop-signal RTMIN+3 \
+        {{IMAGE}} \
+        2>/dev/null || echo "Container '{{CONTAINER}}' already running."
+
+# Stop the node container gracefully.
+down:
+    podman stop --time 30 {{CONTAINER}} 2>/dev/null || true
+    podman rm {{CONTAINER}} 2>/dev/null || true
+
+# Stop and wipe all state. Next `just up && just init` starts fresh.
+reset: down
+    podman volume rm -f u7s-pki u7s-etcd u7s-kubelet u7s-containerd 2>/dev/null || true
+    rm -f kubeconfig
+    @echo "State wiped. Run 'just up && just init' to start fresh."
+
+# Show container logs (live).
+logs:
+    podman logs -f {{CONTAINER}}
+
+# Open a shell inside the node.
+shell:
+    podman exec -it {{CONTAINER}} bash
+
+# Show status of Kubernetes components inside the node.
+status:
+    @echo "=== systemd units ==="
+    podman exec {{CONTAINER}} systemctl status containerd kubelet --no-pager || true
+    @echo ""
+    @echo "=== static pods ==="
+    podman exec {{CONTAINER}} \
+        crictl --runtime-endpoint unix:///run/containerd/containerd.sock pods 2>/dev/null || true
+
+# ── cluster bootstrap (run once after first `just up`) ───────────────────────
+
+# Generate PKI, configs, and static pod manifests. Safe to re-run.
+init: _check-running _gen-pki _gen-configs _gen-apiserver-env _untaint
+    @echo ""
+    @echo "✓ Cluster initialised. Run 'just kubeconfig' then:"
+    @echo "  export KUBECONFIG=$(pwd)/kubeconfig"
+    @echo "  kubectl get pods -A"
+
+# Extract kubeconfig (replaces node name with 127.0.0.1 for local access).
+kubeconfig: _check-running
+    podman exec {{CONTAINER}} \
+        sed "s/{{NODE_NAME}}/127.0.0.1/g" /etc/kubernetes/admin.conf > kubeconfig
+    @echo "export KUBECONFIG=$(pwd)/kubeconfig"
+
+# ── private bootstrap steps ──────────────────────────────────────────────────
+
+_check-running:
+    @podman inspect {{CONTAINER}} --format '{{{{.State.Running}}}}' 2>/dev/null \
+        | grep -q true \
+        || (echo "Container '{{CONTAINER}}' is not running. Run 'just up' first." && exit 1)
+
+# Generate all PKI certificates into the u7s-pki volume (/etc/kubernetes/pki).
+_gen-pki: _check-running
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Idempotent: skip if CA already exists
+    if podman exec {{CONTAINER}} test -f /etc/kubernetes/pki/ca.crt 2>/dev/null; then
+        echo "PKI already exists, skipping."
+        exit 0
+    fi
+    echo "Generating PKI..."
+    podman exec {{CONTAINER}} bash -euc '
+        set -euo pipefail
+        mkdir -p /etc/kubernetes/pki/etcd
+
+        HOST_IP="$HOST_IP"
+        NODE_NAME="$NODE_NAME"
+        APISERVER_PORT="{{PORT_APISERVER}}"
+
+        gen_ca() {
+            local dir="$1" name="$2"
+            openssl genrsa -out "${dir}/${name}.key" 4096
+            openssl req -x509 -new -nodes \
+                -key "${dir}/${name}.key" \
+                -subj "/CN=${name}" \
+                -days 3650 \
+                -out "${dir}/${name}.crt"
+        }
+
+        gen_cert() {
+            local ca_dir="$1" ca_name="$2" dir="$3" name="$4" cn="$5" san="$6"
+            openssl genrsa -out "${dir}/${name}.key" 2048
+            openssl req -new \
+                -key "${dir}/${name}.key" \
+                -subj "/CN=${cn}/O=system:masters" \
+                -out "${dir}/${name}.csr"
+            openssl x509 -req -in "${dir}/${name}.csr" \
+                -CA "${ca_dir}/${ca_name}.crt" \
+                -CAkey "${ca_dir}/${ca_name}.key" \
+                -CAcreateserial \
+                -days 3650 \
+                -extfile <(printf "%s" "${san}") \
+                -out "${dir}/${name}.crt"
+            rm -f "${dir}/${name}.csr"
+        }
+
+        # ── CA certs ──────────────────────────────────────────────────────
+        gen_ca /etc/kubernetes/pki ca
+        gen_ca /etc/kubernetes/pki/etcd ca
+        gen_ca /etc/kubernetes/pki front-proxy-ca
+
+        # ── apiserver cert ────────────────────────────────────────────────
+        gen_cert /etc/kubernetes/pki ca \
+            /etc/kubernetes/pki apiserver kube-apiserver \
+            "subjectAltName=DNS:localhost,DNS:${NODE_NAME},DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.cluster.local,IP:127.0.0.1,IP:10.96.0.1,IP:${HOST_IP}"
+
+        # ── apiserver→kubelet client cert ─────────────────────────────────
+        gen_cert /etc/kubernetes/pki ca \
+            /etc/kubernetes/pki apiserver-kubelet-client kube-apiserver-kubelet-client \
+            "subjectAltName=DNS:${NODE_NAME}"
+
+        # ── front-proxy client cert ───────────────────────────────────────
+        gen_cert /etc/kubernetes/pki front-proxy-ca \
+            /etc/kubernetes/pki front-proxy-client front-proxy-client \
+            "subjectAltName=DNS:${NODE_NAME}"
+
+        # ── etcd certs ────────────────────────────────────────────────────
+        gen_cert /etc/kubernetes/pki/etcd ca \
+            /etc/kubernetes/pki/etcd server etcd-server \
+            "subjectAltName=DNS:localhost,DNS:${NODE_NAME},IP:127.0.0.1"
+
+        gen_cert /etc/kubernetes/pki/etcd ca \
+            /etc/kubernetes/pki/etcd peer etcd-peer \
+            "subjectAltName=DNS:localhost,DNS:${NODE_NAME},IP:127.0.0.1"
+
+        gen_cert /etc/kubernetes/pki/etcd ca \
+            /etc/kubernetes/pki apiserver-etcd-client apiserver-etcd-client \
+            "subjectAltName=DNS:${NODE_NAME}"
+
+        # ── service account key pair ──────────────────────────────────────
+        openssl genrsa -out /etc/kubernetes/pki/sa.key 2048
+        openssl rsa -in /etc/kubernetes/pki/sa.key \
+            -pubout -out /etc/kubernetes/pki/sa.pub
+
+        # ── admin client cert (for kubeconfig) ────────────────────────────
+        gen_cert /etc/kubernetes/pki ca \
+            /etc/kubernetes/pki admin kubernetes-admin \
+            "subjectAltName=DNS:${NODE_NAME}"
+
+        # ── controller-manager client cert ────────────────────────────────
+        gen_cert /etc/kubernetes/pki ca \
+            /etc/kubernetes/pki controller-manager-client system:kube-controller-manager \
+            "subjectAltName=DNS:${NODE_NAME}"
+
+        # ── scheduler client cert ─────────────────────────────────────────
+        gen_cert /etc/kubernetes/pki ca \
+            /etc/kubernetes/pki scheduler-client system:kube-scheduler \
+            "subjectAltName=DNS:${NODE_NAME}"
+
+        # ── kubelet client cert ───────────────────────────────────────────
+        gen_cert /etc/kubernetes/pki ca \
+            /etc/kubernetes/pki kubelet-client "system:node:${NODE_NAME}" \
+            "subjectAltName=DNS:${NODE_NAME},IP:127.0.0.1"
+
+        echo "PKI generation complete."
+    '
+
+# Generate kubeconfig files for each component.
+_gen-configs: _check-running
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if podman exec {{CONTAINER}} test -f /etc/kubernetes/admin.conf 2>/dev/null; then
+        echo "Kubeconfigs already exist, skipping."
+        exit 0
+    fi
+    echo "Generating kubeconfigs..."
+
+    write_kubeconfig() {
+        local dest="$1" user="$2" cert="$3" key="$4"
+        local ca cert_data key_data apiserver
+        apiserver="https://{{NODE_NAME}}:{{PORT_APISERVER}}"
+        ca=$(podman exec {{CONTAINER}} base64 -w0 /etc/kubernetes/pki/ca.crt)
+        cert_data=$(podman exec {{CONTAINER}} base64 -w0 /etc/kubernetes/pki/${cert}.crt)
+        key_data=$(podman exec {{CONTAINER}} base64 -w0 /etc/kubernetes/pki/${key}.key)
+        local yaml
+        yaml="apiVersion: v1"$'\n'
+        yaml+="kind: Config"$'\n'
+        yaml+="clusters:"$'\n'
+        yaml+="- cluster:"$'\n'
+        yaml+="    certificate-authority-data: ${ca}"$'\n'
+        yaml+="    server: ${apiserver}"$'\n'
+        yaml+="  name: kubernetes"$'\n'
+        yaml+="contexts:"$'\n'
+        yaml+="- context:"$'\n'
+        yaml+="    cluster: kubernetes"$'\n'
+        yaml+="    user: ${user}"$'\n'
+        yaml+="  name: ${user}@kubernetes"$'\n'
+        yaml+="current-context: ${user}@kubernetes"$'\n'
+        yaml+="users:"$'\n'
+        yaml+="- name: ${user}"$'\n'
+        yaml+="  user:"$'\n'
+        yaml+="    client-certificate-data: ${cert_data}"$'\n'
+        yaml+="    client-key-data: ${key_data}"$'\n'
+        printf '%s' "$yaml" | podman exec -i {{CONTAINER}} bash -c "cat > ${dest}"
+    }
+
+    write_kubeconfig /etc/kubernetes/admin.conf         kubernetes-admin admin admin
+    write_kubeconfig /etc/kubernetes/controller-manager.conf         system:kube-controller-manager controller-manager-client controller-manager-client
+    write_kubeconfig /etc/kubernetes/scheduler.conf         system:kube-scheduler scheduler-client scheduler-client
+    write_kubeconfig /etc/kubernetes/kubelet.conf         "system:node:{{NODE_NAME}}" kubelet-client kubelet-client
+
+    echo "Kubeconfigs written."
+
+# Patch the apiserver unit with the actual HOST_IP and restart services.
+_gen-apiserver-env: _check-running
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Configuring apiserver with HOST_IP={{HOST_IP}}..."
+    # Replace $HOST_IP placeholder in the unit file with the actual IP
+    podman exec {{CONTAINER}} sed -i         's/--advertise-address=\$HOST_IP/--advertise-address={{HOST_IP}}/g'         /etc/systemd/system/kube-apiserver.service
+    podman exec {{CONTAINER}} systemctl daemon-reload
+    podman exec {{CONTAINER}} systemctl restart etcd kube-apiserver kube-controller-manager kube-scheduler kubelet 2>/dev/null || true
+    echo "Control plane services restarted."
+
+# Remove the control-plane taint so pods schedule on this node.
+_untaint:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Waiting for apiserver to become ready..."
+    for i in $(seq 1 60); do
+        if podman exec {{CONTAINER}}             kubectl --kubeconfig /etc/kubernetes/admin.conf             get nodes 2>/dev/null | grep -q Ready; then
+            echo "Apiserver ready."
+            break
+        fi
+        if [ "$i" -eq 60 ]; then
+            echo "Timed out waiting for apiserver. Check: podman exec u7s systemctl status kubelet"
+            exit 1
+        fi
+        sleep 3
+    done
+    podman exec {{CONTAINER}}         kubectl --kubeconfig /etc/kubernetes/admin.conf         taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
+    podman exec {{CONTAINER}}         kubectl --kubeconfig /etc/kubernetes/admin.conf         taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
+    echo "Node untainted — workloads will schedule."
