@@ -15,7 +15,6 @@
 
 IMAGE        := "localhost/nix-usernetes-node:1.33.10"
 CONTAINER    := "u7s"
-HOST_IP      := `ip -4 route show default | grep -v 'wg\|tun\|vpn\|utun' | head -1 | grep -oP 'src [\d.]+' | awk '{print $2}'`
 NODE_NAME    := "u7s-node"
 POD_SUBNET   := "10.244.0.0/16"
 SVC_SUBNET   := "10.96.0.0/16"
@@ -31,8 +30,8 @@ up:
     podman run -d \
         --name {{CONTAINER}} \
         --hostname {{NODE_NAME}} \
+        --network slirp4netns:allow_host_loopback=true \
         --privileged \
-        --network=host \
         --cgroupns=private \
         --ipc=host \
         --systemd=always \
@@ -41,13 +40,15 @@ up:
         --tmpfs /run \
         --tmpfs /run/lock \
         --tmpfs /tmp \
+        --publish {{PORT_APISERVER}}:{{PORT_APISERVER}} \
+        --publish {{PORT_ETCD}}:{{PORT_ETCD}} \
+        --publish {{PORT_KUBELET}}:{{PORT_KUBELET}} \
         --volume /run/booted-system/kernel-modules/lib/modules:/lib/modules:ro \
         --volume u7s-pki:/etc/kubernetes \
         --volume u7s-etcd:/var/lib/etcd \
         --volume u7s-kubelet:/var/lib/kubelet \
         --volume u7s-containerd:/var/lib/containerd \
         --env container=docker \
-        --env HOST_IP={{HOST_IP}} \
         --env NODE_NAME={{NODE_NAME}} \
         --stop-signal RTMIN+3 \
         {{IMAGE}} \
@@ -112,12 +113,13 @@ _gen-pki: _check-running
         echo "PKI already exists, skipping."
         exit 0
     fi
+    CONTAINER_IP=$(podman exec {{CONTAINER}} ip -4 addr show tap0 | grep "inet " | head -1 | sed 's|.*inet \([0-9.]*\)/.*|\1|')
     echo "Generating PKI..."
-    podman exec {{CONTAINER}} bash -euc '
+    podman exec --env CONTAINER_IP="$CONTAINER_IP" --env NODE_NAME={{NODE_NAME}} {{CONTAINER}} bash -euc '
         set -euo pipefail
         mkdir -p /etc/kubernetes/pki/etcd
 
-        HOST_IP="$HOST_IP"
+        CONTAINER_IP="$CONTAINER_IP"
         NODE_NAME="$NODE_NAME"
         APISERVER_PORT="{{PORT_APISERVER}}"
 
@@ -156,7 +158,7 @@ _gen-pki: _check-running
         # ── apiserver cert ────────────────────────────────────────────────
         gen_cert /etc/kubernetes/pki ca \
             /etc/kubernetes/pki apiserver kube-apiserver \
-            "subjectAltName=DNS:localhost,DNS:${NODE_NAME},DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.cluster.local,IP:127.0.0.1,IP:10.96.0.1,IP:${HOST_IP}"
+            "subjectAltName=DNS:localhost,DNS:${NODE_NAME},DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.cluster.local,IP:127.0.0.1,IP:10.96.0.1,IP:${CONTAINER_IP}"
 
         # ── apiserver→kubelet client cert ─────────────────────────────────
         gen_cert /etc/kubernetes/pki ca \
@@ -259,9 +261,11 @@ _gen-configs: _check-running
 _gen-apiserver-env: _check-running
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "Configuring apiserver with HOST_IP={{HOST_IP}}..."
-    # Replace $HOST_IP placeholder in the unit file with the actual IP
-    podman exec {{CONTAINER}} sed -i         's/--advertise-address=\$HOST_IP/--advertise-address={{HOST_IP}}/g'         /etc/systemd/system/kube-apiserver.service
+    CONTAINER_IP=$(podman exec {{CONTAINER}} ip -4 addr show tap0 | awk '/inet / {print $2}' | cut -d/ -f1)
+    echo "Configuring apiserver with CONTAINER_IP=${CONTAINER_IP}..."
+    podman exec {{CONTAINER}} sed -i \
+        "s/--advertise-address=\$HOST_IP/--advertise-address=${CONTAINER_IP}/g" \
+        /etc/systemd/system/kube-apiserver.service
     podman exec {{CONTAINER}} systemctl daemon-reload
     podman exec {{CONTAINER}} systemctl restart etcd kube-apiserver kube-controller-manager kube-scheduler kubelet 2>/dev/null || true
     echo "Control plane services restarted."

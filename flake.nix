@@ -201,8 +201,8 @@
           [Unit]
           Description=containerd container runtime
           After=network.target
-
           [Service]
+          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${containerd}/bin:${runc}/bin:${cri-tools}/bin:${pkgs.rootlesskit}/bin:${pkgs.slirp4netns}/bin
           ExecStartPre=-/sbin/modprobe overlay
           ExecStart=${containerd}/bin/containerd
           Restart=always
@@ -213,7 +213,6 @@
           LimitNOFILE=1048576
           LimitNPROC=infinity
           LimitCORE=infinity
-
           [Install]
           WantedBy=multi-user.target
         '';
@@ -289,6 +288,7 @@
           Requires=containerd.service
 
           [Service]
+          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetesPatched}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin
           ExecStartPre=/bin/sh -c 'grep -q u7s-node /etc/hosts || echo "127.0.0.1 u7s-node" >> /etc/hosts'
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/kubelet.conf; do sleep 2; done'
           ExecStart=${kubernetesPatched}/bin/kubelet             --config=/etc/kubelet/kubelet-config.yaml             --kubeconfig=/etc/kubernetes/kubelet.conf             --v=2
@@ -300,13 +300,30 @@
           WantedBy=multi-user.target
         '';
 
+        kubeProxyUnit = pkgs.writeText "kube-proxy.service" ''
+          [Unit]
+          Description=kube-proxy
+          After=network.target kube-apiserver.service
+          [Service]
+          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetesPatched}/bin:${pkgs.nftables}/bin
+          ExecStart=${kubernetesPatched}/bin/kube-proxy \
+            --kubeconfig=/etc/kubernetes/admin.conf \
+            --proxy-mode=iptables \
+            --cluster-cidr=10.244.0.0/24 \
+            --conntrack-max-per-core=0
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+        '';
+
         kubeletConfig = pkgs.writeText "kubelet-config.yaml" ''
           apiVersion: kubelet.config.k8s.io/v1beta1
           kind: KubeletConfiguration
           featureGates:
             KubeletInUserNamespace: true
           failSwapOn: false
-          cgroupDriver: systemd
+          cgroupDriver: cgroupfs
           cgroupsPerQOS: false
           enforceNodeAllocatable: []
           containerRuntimeEndpoint: "unix:///run/containerd/containerd.sock"
@@ -323,16 +340,19 @@
 
         containerdConfig = pkgs.writeText "containerd-config.toml" ''
           version = 3
-
           [plugins."io.containerd.cri.v1.runtime"]
+            sandbox_image = "registry.k8s.io/pause:3.10"
+            restrict_oom_score_adj = true
             [plugins."io.containerd.cri.v1.runtime".cni]
-              bin_dir = "/opt/cni/bin"
+              bin_dirs = ["/opt/cni/bin"]
               conf_dir = "/etc/cni/net.d"
             [plugins."io.containerd.cri.v1.runtime".containerd]
+              default_runtime_name = "runc"
               [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
                 runtime_type = "io.containerd.runc.v2"
                 [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
-                  SystemdCgroup = true
+                  SystemdCgroup = false
+                  NoPivotRoot = true
         '';
 
         cniConfig = pkgs.writeText "10-u7s.conflist" ''
@@ -568,32 +588,30 @@ PRETTY_NAME="nix-usernetes"
           tag  = k8sVersion;
 
           contents = pkgs.lib.flatten [
-            pkgs.dockerTools.fakeNss
-            pkgs.dockerTools.usrBinEnv
-            coreutils
             bash
-            util-linux
+            cniPlugins
+            conntrack-tools
+            containerd
+            coreutils
+            cri-tools
+            curl
+            ethtool
             findutils
             gnugrep
-            pkgs.gnused
-            procps
-            kmod
-            curl
-            socat
-            jq
-
             iproute2
             iptables
-            ethtool
-            conntrack-tools
-
-            containerd
-            runc
-            cri-tools
-            cniPlugins
-
+            jq
+            kmod
             openssl
             pkgs.cacert
+            pkgs.dockerTools.fakeNss
+            pkgs.dockerTools.usrBinEnv
+            pkgs.gnused
+            pkgs.nftables
+            procps
+            runc
+            socat
+            util-linux
 
             # All control plane components run as native systemd units — no container pulls
             kubernetesPatched
@@ -642,6 +660,9 @@ PRETTY_NAME="nix-usernetes"
             cp ${controllerManagerUnit} etc/systemd/system/kube-controller-manager.service
             cp ${schedulerUnit}         etc/systemd/system/kube-scheduler.service
             cp ${kubeletUnit}           etc/systemd/system/kubelet.service
+            cp ${kubeProxyUnit} etc/systemd/system/kube-proxy.service
+
+            ln -sf /etc/systemd/system/kube-proxy.service etc/systemd/system/multi-user.target.wants/kube-proxy.service
             ln -sf /etc/systemd/system/containerd.service         etc/systemd/system/multi-user.target.wants/containerd.service
             ln -sf /etc/systemd/system/etcd.service                 etc/systemd/system/multi-user.target.wants/etcd.service
             ln -sf /etc/systemd/system/kube-apiserver.service       etc/systemd/system/multi-user.target.wants/kube-apiserver.service
