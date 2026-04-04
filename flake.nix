@@ -355,6 +355,28 @@
                   NoPivotRoot = true
         '';
 
+        sysctlConfig = pkgs.writeText "99-u7s.conf" ''
+          net.ipv4.conf.default.arp_notify=1
+          net.ipv4.conf.default.arp_accept=1
+          net.ipv4.conf.all.arp_ignore=0
+          net.ipv4.ip_forward=1
+        '';
+
+        sysctlUnit = pkgs.writeText "u7s-sysctl.service" ''
+          [Unit]
+          Description=Apply u7s sysctls
+          Before=containerd.service kubelet.service
+          DefaultDependencies=no
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=${pkgs.procps}/bin/sysctl -p /etc/sysctl.d/99-u7s.conf
+
+          [Install]
+          WantedBy=multi-user.target
+        '';
+
         cniConfig = pkgs.writeText "10-u7s.conflist" ''
           {
             "cniVersion": "1.0.0",
@@ -367,6 +389,13 @@
                   "type": "host-local",
                   "ranges": [[{ "subnet": "10.244.0.0/24" }]],
                   "routes": [{ "dst": "0.0.0.0/0" }]
+                }
+              },
+              {
+                "type": "tuning",
+                "sysctl": {
+                  "net.ipv4.conf.IFNAME.arp_notify": "1",
+                  "net.ipv4.conf.IFNAME.arp_accept": "1"
                 }
               },
               {
@@ -627,6 +656,9 @@ PRETTY_NAME="nix-usernetes"
             mkdir -p etc/containerd
             cp ${containerdConfig} etc/containerd/config.toml
 
+            mkdir -p etc/sysctl.d
+            cp ${sysctlConfig} etc/sysctl.d/99-u7s.conf
+
             # CA certificates
             mkdir -p etc/ssl/certs
             ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt etc/ssl/certs/ca-certificates.crt
@@ -661,6 +693,7 @@ PRETTY_NAME="nix-usernetes"
             cp ${schedulerUnit}         etc/systemd/system/kube-scheduler.service
             cp ${kubeletUnit}           etc/systemd/system/kubelet.service
             cp ${kubeProxyUnit} etc/systemd/system/kube-proxy.service
+            cp ${sysctlUnit} etc/systemd/system/u7s-sysctl.service
 
             ln -sf /etc/systemd/system/kube-proxy.service etc/systemd/system/multi-user.target.wants/kube-proxy.service
             ln -sf /etc/systemd/system/containerd.service         etc/systemd/system/multi-user.target.wants/containerd.service
@@ -669,6 +702,8 @@ PRETTY_NAME="nix-usernetes"
             ln -sf /etc/systemd/system/kube-controller-manager.service etc/systemd/system/multi-user.target.wants/kube-controller-manager.service
             ln -sf /etc/systemd/system/kube-scheduler.service       etc/systemd/system/multi-user.target.wants/kube-scheduler.service
             ln -sf /etc/systemd/system/kubelet.service              etc/systemd/system/multi-user.target.wants/kubelet.service
+            ln -sf /etc/systemd/system/u7s-sysctl.service etc/systemd/system/multi-user.target.wants/u7s-sysctl.service
+
 
             # Standard dirs
             mkdir -p var/lib/kubelet var/lib/etcd
@@ -707,10 +742,124 @@ PRETTY_NAME="nix-usernetes"
           };
         };
 
+        debugScript = pkgs.writeTextFile {
+          name = "u7s-debug";
+          executable = true;
+          destination = "/usr/local/bin/u7s-debug";
+          text = ''
+            #!/usr/bin/env nu
+        
+            def section [title: string] {
+              print $"\n(ansi green_bold)══ ($title) ══(ansi reset)"
+            }
+        
+            def main [] {
+              section "Interfaces & Addresses"
+              ip addr show
+        
+              section "Routing Tables"
+              ip route show table all
+        
+              section "ARP / Neighbor Table"
+              ip neigh show
+        
+              section "iptables NAT PREROUTING"
+              iptables -t nat -L PREROUTING -n -v
+        
+              section "iptables NAT POSTROUTING"
+              iptables -t nat -L POSTROUTING -n -v
+        
+              section "iptables NAT KUBE-SERVICES"
+              iptables -t nat -L KUBE-SERVICES -n -v
+        
+              section "nftables ruleset (nat table)"
+              nft list table ip nat
+        
+              section "nftables ruleset (filter table)"  
+              nft list table ip filter
+        
+              section "Conntrack table (first 20)"
+              conntrack -L 2>/dev/null | head -20
+        
+              section "Interface packet counters"
+              cat /proc/net/dev
+        
+              section "Connectivity: apiserver (10.96.0.1:443)"
+              curl --max-time 3 -sk https://10.96.0.1:443 | from json | get kind
+        
+              section "Connectivity: internet (1.1.1.1)"
+              let result = (curl --max-time 3 -sI http://1.1.1.1 | lines | first)
+              print $result
+        
+              section "Pod CIDR routes"
+              ip route show | where ($it | str contains "10.244")
+        
+              section "Done"
+            }
+          '';
+        };
+        
+        debugImage = pkgs.dockerTools.buildLayeredImage {
+          name = "nix-usernetes-debug";
+          tag  = "latest";
+          contents = pkgs.lib.flatten [
+            bash
+            pkgs.nushell
+            pkgs.vim
+            pkgs.strace
+            pkgs.tcpdump
+            conntrack-tools
+            iproute2
+            iptables
+            pkgs.nftables
+            pkgs.iputils
+            curl
+            socat
+            jq
+            procps
+            pkgs.cacert
+            debugEtc
+          ];
+          extraCommands = ''
+            mkdir -p usr/local/bin etc root
+            cp ${debugScript}/usr/local/bin/u7s-debug usr/local/bin/u7s-debug
+            mkdir -p etc/ssl/certs
+            ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt etc/ssl/certs/ca-certificates.crt
+            # Replace absolute symlinks with relative ones to work around containerd 2.2.x bug
+            # https://github.com/containerd/containerd/issues/12683
+            for f in etc/passwd etc/group etc/shadow; do
+              if [ -L "$f" ]; then
+                target=$(readlink "$f")
+                # Make relative: strip leading / and compute relative path from /etc
+                reltarget=$(echo "$target" | sed 's|^/|../../|')
+                rm "$f"
+                ln -sf "$reltarget" "$f"
+              fi
+            done
+          '';
+          config = {
+            Cmd = [ "/usr/local/bin/u7s-debug" ];
+            Entrypoint = [ "${pkgs.nushell}/bin/nu" ];
+            Env = [
+              "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
+              "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin"
+            ];
+          };
+        };
+
+        debugEtc = pkgs.runCommand "debug-etc" {} ''
+          mkdir -p $out/etc
+          echo "root:x:0:0:root:/root:/bin/sh" > $out/etc/passwd
+          echo "root:x:0:" > $out/etc/group
+          echo "root:!:19000:0:99999:7:::" > $out/etc/shadow
+          mkdir -p $out/root
+        '';
+
       in {
         packages = {
           kubernetes  = kubernetesPatched;
           node-image  = nodeImage;
+          debug-image = debugImage;
           default     = nodeImage;
         };
 

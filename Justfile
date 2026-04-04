@@ -85,7 +85,7 @@ status:
 # ── cluster bootstrap (run once after first `just up`) ───────────────────────
 
 # Generate PKI, configs, and static pod manifests. Safe to re-run.
-init: _check-running _gen-pki _gen-configs _gen-apiserver-env _untaint
+init: _gen-pki _gen-configs _gen-apiserver-env _untaint _prepull-images _install-cert-manager
     @echo ""
     @echo "✓ Cluster initialised. Run 'just kubeconfig' then:"
     @echo "  export KUBECONFIG=$(pwd)/kubeconfig"
@@ -108,7 +108,6 @@ _check-running:
 _gen-pki: _check-running
     #!/usr/bin/env bash
     set -euo pipefail
-    # Idempotent: skip if CA already exists
     if podman exec {{CONTAINER}} test -f /etc/kubernetes/pki/ca.crt 2>/dev/null; then
         echo "PKI already exists, skipping."
         exit 0
@@ -250,18 +249,26 @@ _gen-configs: _check-running
         printf '%s' "$yaml" | podman exec -i {{CONTAINER}} bash -c "cat > ${dest}"
     }
 
-    write_kubeconfig /etc/kubernetes/admin.conf         kubernetes-admin admin admin
-    write_kubeconfig /etc/kubernetes/controller-manager.conf         system:kube-controller-manager controller-manager-client controller-manager-client
-    write_kubeconfig /etc/kubernetes/scheduler.conf         system:kube-scheduler scheduler-client scheduler-client
-    write_kubeconfig /etc/kubernetes/kubelet.conf         "system:node:{{NODE_NAME}}" kubelet-client kubelet-client
+    write_kubeconfig /etc/kubernetes/admin.conf \
+        kubernetes-admin admin admin
+    write_kubeconfig /etc/kubernetes/controller-manager.conf \
+        system:kube-controller-manager controller-manager-client controller-manager-client
+    write_kubeconfig /etc/kubernetes/scheduler.conf \
+        system:kube-scheduler scheduler-client scheduler-client
+    write_kubeconfig /etc/kubernetes/kubelet.conf \
+        "system:node:{{NODE_NAME}}" kubelet-client kubelet-client
 
     echo "Kubeconfigs written."
 
-# Patch the apiserver unit with the actual HOST_IP and restart services.
+# Patch the apiserver unit with the actual CONTAINER_IP and restart services.
 _gen-apiserver-env: _check-running
     #!/usr/bin/env bash
     set -euo pipefail
-    CONTAINER_IP=$(podman exec {{CONTAINER}} ip -4 addr show tap0 | awk '/inet / {print $2}' | cut -d/ -f1)
+    if podman exec {{CONTAINER}} grep -q "advertise-address=10\." /etc/systemd/system/kube-apiserver.service 2>/dev/null; then
+        echo "Apiserver already configured, skipping."
+        exit 0
+    fi
+    CONTAINER_IP=$(podman exec {{CONTAINER}} ip -4 addr show tap0 | grep "inet " | head -1 | sed 's|.*inet \([0-9.]*\)/.*|\1|')
     echo "Configuring apiserver with CONTAINER_IP=${CONTAINER_IP}..."
     podman exec {{CONTAINER}} sed -i \
         "s/--advertise-address=\$HOST_IP/--advertise-address=${CONTAINER_IP}/g" \
@@ -270,13 +277,15 @@ _gen-apiserver-env: _check-running
     podman exec {{CONTAINER}} systemctl restart etcd kube-apiserver kube-controller-manager kube-scheduler kubelet 2>/dev/null || true
     echo "Control plane services restarted."
 
-# Remove the control-plane taint so pods schedule on this node.
-_untaint:
+# Wait for apiserver and remove the control-plane taint so pods schedule on this node.
+_untaint: _check-running
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Waiting for apiserver to become ready..."
     for i in $(seq 1 60); do
-        if podman exec {{CONTAINER}}             kubectl --kubeconfig /etc/kubernetes/admin.conf             get nodes 2>/dev/null | grep -q Ready; then
+        if podman exec {{CONTAINER}} \
+            kubectl --kubeconfig /etc/kubernetes/admin.conf \
+            get nodes 2>/dev/null | grep -q Ready; then
             echo "Apiserver ready."
             break
         fi
@@ -286,6 +295,86 @@ _untaint:
         fi
         sleep 3
     done
-    podman exec {{CONTAINER}}         kubectl --kubeconfig /etc/kubernetes/admin.conf         taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
-    podman exec {{CONTAINER}}         kubectl --kubeconfig /etc/kubernetes/admin.conf         taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
+    podman exec {{CONTAINER}} \
+        kubectl --kubeconfig /etc/kubernetes/admin.conf \
+        taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
+    podman exec {{CONTAINER}} \
+        kubectl --kubeconfig /etc/kubernetes/admin.conf \
+        taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
     echo "Node untainted — workloads will schedule."
+
+# Pre-pull images into the cluster containerd. Uses local podman cache if available.
+_prepull-images: _check-running
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for img in \
+        registry.k8s.io/pause:3.10 \
+        quay.io/jetstack/cert-manager-controller:v1.19.2 \
+        quay.io/jetstack/cert-manager-cainjector:v1.19.2 \
+        quay.io/jetstack/cert-manager-webhook:v1.19.2; do
+        if podman exec {{CONTAINER}} ctr -n k8s.io images check "$img" &>/dev/null; then
+            echo "Image $img already in cluster, skipping."
+            continue
+        fi
+        if ! podman image exists "$img" 2>/dev/null; then
+            echo "Pulling $img into local cache..."
+            podman pull "$img"
+        fi
+        echo "Loading $img into cluster..."
+        podman save "$img" | podman exec -i {{CONTAINER}} ctr -n k8s.io images import -
+    done
+
+# Install cert-manager into the cluster. Idempotent.
+_install-cert-manager: _check-running
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if podman exec {{CONTAINER}} kubectl --kubeconfig /etc/kubernetes/admin.conf \
+        get namespace cert-manager &>/dev/null; then
+        echo "cert-manager already installed, skipping."
+        exit 0
+    fi
+    podman exec {{CONTAINER}} kubectl --kubeconfig /etc/kubernetes/admin.conf \
+        apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.19.2/cert-manager.yaml
+
+# ── pod debugging tools ───────────────────────────────────────────────────────
+
+_u7s_kubeconf := justfile_directory() + "/kubeconfig"
+
+# Build and load the debug image into the cluster.
+debug-image: _check-running
+    nix build .#debug-image -o result-debug-image
+    podman load -i result-debug-image
+    podman exec -i {{CONTAINER}} ctr -n k8s.io images import - < result-debug-image
+
+# Deploy a debug pod (stays running for exec). Idempotent.
+debug-deploy: _check-running
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if KUBECONFIG={{_u7s_kubeconf}} kubectl get pod u7s-debug &>/dev/null; then
+        echo "Debug pod already exists, skipping."
+        exit 0
+    fi
+    KUBECONFIG={{_u7s_kubeconf}} kubectl run u7s-debug \
+        --image=docker.io/library/nix-usernetes-debug:latest \
+        --image-pull-policy=Never \
+        --restart=Never \
+        --command -- sleep infinity
+
+# Run debug script in node context.
+debug-run: _check-running
+    KUBECONFIG={{_u7s_kubeconf}} kubectl exec u7s-debug -- /usr/local/bin/u7s-debug
+
+# Drop into a debug shell.
+debug-shell: _check-running
+    KUBECONFIG={{_u7s_kubeconf}} kubectl exec -it u7s-debug -- nu
+
+# Run debug script in a specific pod's netns.
+# Usage: just debug-pod cert-manager/cert-manager-7b8b89f89d-xxxxx
+debug-pod pod: _check-running
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NS=$(echo "{{pod}}" | cut -d/ -f1)
+    NAME=$(echo "{{pod}}" | cut -d/ -f2)
+    NETNS=$(podman exec {{CONTAINER}} sh -c "crictl --runtime-endpoint unix:///run/containerd/containerd.sock pods --namespace $NS --name $NAME -q 2>/dev/null | xargs -I{} crictl --runtime-endpoint unix:///run/containerd/containerd.sock inspectp {} 2>/dev/null | jq -r '.info.runtimeSpec.linux.namespaces[] | select(.type==\"network\") | .path'")
+    echo "Pod netns: $NETNS"
+    KUBECONFIG={{_u7s_kubeconf}} kubectl exec u7s-debug -- nsenter --net=$NETNS /usr/local/bin/u7s-debug
