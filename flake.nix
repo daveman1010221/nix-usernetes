@@ -15,15 +15,32 @@
         };
 
         # ── versioning ────────────────────────────────────────────────────────
-        k8sVersion    = "1.33.10";
-        k8sTag        = "v${k8sVersion}";
-        k8sSha256     = "sha256-pN06vX2i9PUP/nlYNoKh+ZCFaQO10gCUjBLmnmMt2P8=";
+        k8sVersion     = "1.33.10";
+        k8sTag         = "v${k8sVersion}";
+        k8sSha256      = "sha256-pN06vX2i9PUP/nlYNoKh+ZCFaQO10gCUjBLmnmMt2P8=";
+        coreDNSVersion = "1.12.1";
 
         # Our patched cAdvisor fork (adds "f2fs": true to supportedFsType map)
         cadvisorForkOwner  = "daveman1010221";
         cadvisorForkBranch = "fix-f2fs-v0.52.1";
         cadvisorForkRev    = "v0.52.2-f2fs";
         cadvisorForkSha256 = "sha256-E4ikMWyfapmTbgD8Y359n0Cx953SY2mDy/QDRgLUnMU=";
+
+        # ── CoreDNS OCI image ─────────────────────────────────────────────────
+        # Fetched by Nix at build time and bundled into the node image.
+        # The image-preload systemd service imports it into containerd before
+        # kubelet starts, so CoreDNS is available without any network access
+        # at cluster init time.
+        #
+        # To update: set sha256 = pkgs.lib.fakeHash, run `nix build`, copy
+        # the correct hash from the error output, replace fakeHash with it.
+        coreDNSImage = pkgs.dockerTools.pullImage {
+          imageName      = "registry.k8s.io/coredns/coredns";
+          imageDigest    = "sha256:4f7a57135719628cf2070c5e3cbde64b013e90d4c560c5ecbf14004181f91998";
+          sha256         = "sha256-8Op3vzupnC6kWIgjqk4ck2tzY2sra+L3xdzoQ4TTUtI=";
+          finalImageName = "registry.k8s.io/coredns/coredns";
+          finalImageTag  = "v${coreDNSVersion}";
+        };
 
         # ── packages from nixpkgs ─────────────────────────────────────────────
         inherit (pkgs)
@@ -195,7 +212,7 @@
           };
         };
 
-        # ── systemd units and configs baked into the image ──────────────────
+        # ── systemd units and configs baked into the image ────────────────────
 
         containerdUnit = pkgs.writeText "containerd.service" ''
           [Unit]
@@ -224,7 +241,22 @@
 
           [Service]
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/pki/etcd/server.crt; do sleep 2; done'
-          ExecStart=${etcd}/bin/etcd             --data-dir=/var/lib/etcd             --listen-client-urls=https://127.0.0.1:2379             --advertise-client-urls=https://127.0.0.1:2379             --listen-peer-urls=https://127.0.0.1:2380             --initial-advertise-peer-urls=https://127.0.0.1:2380             --initial-cluster=default=https://127.0.0.1:2380             --cert-file=/etc/kubernetes/pki/etcd/server.crt             --key-file=/etc/kubernetes/pki/etcd/server.key             --client-cert-auth=true             --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt             --peer-cert-file=/etc/kubernetes/pki/etcd/peer.crt             --peer-key-file=/etc/kubernetes/pki/etcd/peer.key             --peer-client-cert-auth=true             --peer-trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt             --snapshot-count=10000
+          ExecStart=${etcd}/bin/etcd \
+            --data-dir=/var/lib/etcd \
+            --listen-client-urls=https://127.0.0.1:2379 \
+            --advertise-client-urls=https://127.0.0.1:2379 \
+            --listen-peer-urls=https://127.0.0.1:2380 \
+            --initial-advertise-peer-urls=https://127.0.0.1:2380 \
+            --initial-cluster=default=https://127.0.0.1:2380 \
+            --cert-file=/etc/kubernetes/pki/etcd/server.crt \
+            --key-file=/etc/kubernetes/pki/etcd/server.key \
+            --client-cert-auth=true \
+            --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt \
+            --peer-cert-file=/etc/kubernetes/pki/etcd/peer.crt \
+            --peer-key-file=/etc/kubernetes/pki/etcd/peer.key \
+            --peer-client-cert-auth=true \
+            --peer-trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt \
+            --snapshot-count=10000
           Restart=always
           RestartSec=5
 
@@ -240,7 +272,34 @@
 
           [Service]
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/pki/apiserver.crt; do sleep 2; done'
-          ExecStart=${kubernetesPatched}/bin/kube-apiserver             --advertise-address=$HOST_IP             --bind-address=0.0.0.0             --allow-privileged=true             --authorization-mode=Node,RBAC             --client-ca-file=/etc/kubernetes/pki/ca.crt             --enable-admission-plugins=NodeRestriction             --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt             --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt             --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key             --etcd-servers=https://127.0.0.1:2379             --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt             --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key             --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname             --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt             --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key             --requestheader-allowed-names=front-proxy-client             --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt             --requestheader-extra-headers-prefix=X-Remote-Extra-             --requestheader-group-headers=X-Remote-Group             --requestheader-username-headers=X-Remote-User             --secure-port=6443             --service-account-issuer=https://kubernetes.default.svc.cluster.local             --service-account-key-file=/etc/kubernetes/pki/sa.pub             --service-account-signing-key-file=/etc/kubernetes/pki/sa.key             --service-cluster-ip-range=10.96.0.0/16             --tls-cert-file=/etc/kubernetes/pki/apiserver.crt             --tls-private-key-file=/etc/kubernetes/pki/apiserver.key
+          ExecStart=${kubernetesPatched}/bin/kube-apiserver \
+            --advertise-address=$HOST_IP \
+            --bind-address=0.0.0.0 \
+            --allow-privileged=true \
+            --authorization-mode=Node,RBAC \
+            --client-ca-file=/etc/kubernetes/pki/ca.crt \
+            --enable-admission-plugins=NodeRestriction \
+            --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt \
+            --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt \
+            --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key \
+            --etcd-servers=https://127.0.0.1:2379 \
+            --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt \
+            --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key \
+            --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname \
+            --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt \
+            --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key \
+            --requestheader-allowed-names=front-proxy-client \
+            --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt \
+            --requestheader-extra-headers-prefix=X-Remote-Extra- \
+            --requestheader-group-headers=X-Remote-Group \
+            --requestheader-username-headers=X-Remote-User \
+            --secure-port=6443 \
+            --service-account-issuer=https://kubernetes.default.svc.cluster.local \
+            --service-account-key-file=/etc/kubernetes/pki/sa.pub \
+            --service-account-signing-key-file=/etc/kubernetes/pki/sa.key \
+            --service-cluster-ip-range=10.96.0.0/16 \
+            --tls-cert-file=/etc/kubernetes/pki/apiserver.crt \
+            --tls-private-key-file=/etc/kubernetes/pki/apiserver.key
           Restart=always
           RestartSec=5
           PassEnvironment=HOST_IP
@@ -257,7 +316,19 @@
 
           [Service]
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/controller-manager.conf; do sleep 2; done'
-          ExecStart=${kubernetesPatched}/bin/kube-controller-manager             --allocate-node-cidrs=true             --cluster-cidr=10.244.0.0/16             --cluster-name=kubernetes             --cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt             --cluster-signing-key-file=/etc/kubernetes/pki/ca.key             --controllers=*,bootstrapsigner,tokencleaner             --kubeconfig=/etc/kubernetes/controller-manager.conf             --leader-elect=false             --root-ca-file=/etc/kubernetes/pki/ca.crt             --service-account-private-key-file=/etc/kubernetes/pki/sa.key             --service-cluster-ip-range=10.96.0.0/16             --use-service-account-credentials=true
+          ExecStart=${kubernetesPatched}/bin/kube-controller-manager \
+            --allocate-node-cidrs=true \
+            --cluster-cidr=10.244.0.0/16 \
+            --cluster-name=kubernetes \
+            --cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt \
+            --cluster-signing-key-file=/etc/kubernetes/pki/ca.key \
+            --controllers=*,bootstrapsigner,tokencleaner \
+            --kubeconfig=/etc/kubernetes/controller-manager.conf \
+            --leader-elect=false \
+            --root-ca-file=/etc/kubernetes/pki/ca.crt \
+            --service-account-private-key-file=/etc/kubernetes/pki/sa.key \
+            --service-cluster-ip-range=10.96.0.0/16 \
+            --use-service-account-credentials=true
           Restart=always
           RestartSec=5
 
@@ -273,7 +344,9 @@
 
           [Service]
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/scheduler.conf; do sleep 2; done'
-          ExecStart=${kubernetesPatched}/bin/kube-scheduler             --kubeconfig=/etc/kubernetes/scheduler.conf             --leader-elect=false
+          ExecStart=${kubernetesPatched}/bin/kube-scheduler \
+            --kubeconfig=/etc/kubernetes/scheduler.conf \
+            --leader-elect=false
           Restart=always
           RestartSec=5
 
@@ -281,17 +354,22 @@
           WantedBy=multi-user.target
         '';
 
+        # kubelet depends on image-preload so CoreDNS is in containerd
+        # before kubelet reads the static pod manifest directory.
         kubeletUnit = pkgs.writeText "kubelet.service" ''
           [Unit]
           Description=kubelet
-          After=containerd.service
+          After=containerd.service image-preload.service
           Requires=containerd.service
 
           [Service]
           Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetesPatched}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin
           ExecStartPre=/bin/sh -c 'grep -q u7s-node /etc/hosts || echo "127.0.0.1 u7s-node" >> /etc/hosts'
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/kubelet.conf; do sleep 2; done'
-          ExecStart=${kubernetesPatched}/bin/kubelet             --config=/etc/kubelet/kubelet-config.yaml             --kubeconfig=/etc/kubernetes/kubelet.conf             --v=2
+          ExecStart=${kubernetesPatched}/bin/kubelet \
+            --config=/etc/kubelet/kubelet-config.yaml \
+            --kubeconfig=/etc/kubernetes/kubelet.conf \
+            --v=2
           Restart=always
           RestartSec=10
           TimeoutStopSec=60
@@ -317,6 +395,12 @@
           WantedBy=multi-user.target
         '';
 
+        # ── kubelet configuration ─────────────────────────────────────────────
+        # clusterDNS points at the kube-dns Service IP (10.96.0.10).
+        # This is the well-known convention: the 10th address in the service
+        # CIDR (10.96.0.0/16 → 10.96.0.10) is reserved for kube-dns.
+        # The kube-dns Service is applied by cluster-bootstrap.service after
+        # the apiserver becomes ready.
         kubeletConfig = pkgs.writeText "kubelet-config.yaml" ''
           apiVersion: kubelet.config.k8s.io/v1beta1
           kind: KubeletConfiguration
@@ -327,6 +411,10 @@
           cgroupsPerQOS: false
           enforceNodeAllocatable: []
           containerRuntimeEndpoint: "unix:///run/containerd/containerd.sock"
+          staticPodPath: /etc/kubernetes/manifests
+          clusterDNS:
+            - 10.96.0.10
+          clusterDomain: cluster.local
           authentication:
             anonymous:
               enabled: true
@@ -406,7 +494,230 @@
           }
         '';
 
-        # ── systemd units derivation ─────────────────────────────────────────
+        # ── CoreDNS Corefile ──────────────────────────────────────────────────
+        # Mounted as a hostPath volume by the CoreDNS static pod.
+        # Forwards upstream DNS to 10.0.2.3, the slirp4netns virtual gateway,
+        # which forwards to the host resolver stack.
+        coreDNSCorefile = pkgs.writeText "Corefile" ''
+          .:53 {
+              errors
+              health {
+                  lameduck 5s
+              }
+              ready
+              kubernetes cluster.local in-addr.arpa ip6.arpa {
+                  pods insecure
+                  fallthrough in-addr.arpa ip6.arpa
+                  ttl 30
+                  kubeconfig /etc/kubernetes/coredns.conf kubernetes-admin@kubernetes
+              }
+              forward . 10.0.2.3
+              cache 30
+              loop
+              reload
+              loadbalance
+          }
+        '';
+
+        # ── CoreDNS static pod manifest ───────────────────────────────────────
+        # kubelet watches /etc/kubernetes/manifests/ and manages this pod
+        # automatically. imagePullPolicy: Never — the image is preloaded into
+        # containerd by image-preload.service before kubelet starts.
+        # coredns.conf uses 127.0.0.1 as the apiserver address to avoid a
+        # chicken-and-egg problem where CoreDNS needs DNS to resolve u7s-node.
+        coreDNSManifest = pkgs.writeText "coredns.yaml" ''
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: coredns
+            namespace: kube-system
+            labels:
+              k8s-app: kube-dns
+          spec:
+            priorityClassName: system-node-critical
+            tolerations:
+              - key: CriticalAddonsOnly
+                operator: Exists
+              - key: node-role.kubernetes.io/control-plane
+                effect: NoSchedule
+            containers:
+              - name: coredns
+                image: registry.k8s.io/coredns/coredns:v${coreDNSVersion}
+                imagePullPolicy: Never
+                args: [ "-conf", "/etc/coredns/Corefile" ]
+                volumeMounts:
+                  - name: config-volume
+                    mountPath: /etc/coredns
+                    readOnly: true
+                  - name: kubeconfig
+                    mountPath: /etc/kubernetes/coredns.conf
+                    readOnly: true
+                ports:
+                  - containerPort: 53
+                    name: dns
+                    protocol: UDP
+                  - containerPort: 53
+                    name: dns-tcp
+                    protocol: TCP
+                  - containerPort: 9153
+                    name: metrics
+                    protocol: TCP
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                    scheme: HTTP
+                  initialDelaySeconds: 60
+                  timeoutSeconds: 5
+                  successThreshold: 1
+                  failureThreshold: 5
+                readinessProbe:
+                  httpGet:
+                    path: /ready
+                    port: 8181
+                    scheme: HTTP
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    add:
+                      - NET_BIND_SERVICE
+                    drop:
+                      - ALL
+                  readOnlyRootFilesystem: true
+            volumes:
+              - name: config-volume
+                hostPath:
+                  path: /etc/coredns
+                  type: Directory
+              - name: kubeconfig
+                hostPath:
+                  path: /etc/kubernetes/coredns.conf
+                  type: File
+            dnsPolicy: Default
+        '';
+
+        # ── kube-dns Service manifest ─────────────────────────────────────────
+        # Applied by cluster-bootstrap.service after the apiserver is ready.
+        # Gives CoreDNS its well-known cluster IP (10.96.0.10) so that
+        # kubelet's clusterDNS setting resolves correctly. Static pods cannot
+        # self-register a Service — this is the one resource that requires a
+        # live apiserver.
+        kubeDNSServiceManifest = pkgs.writeText "kube-dns-service.yaml" ''
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: kube-dns
+            namespace: kube-system
+            labels:
+              k8s-app: kube-dns
+              kubernetes.io/cluster-service: "true"
+              kubernetes.io/name: CoreDNS
+            annotations:
+              prometheus.io/port: "9153"
+              prometheus.io/scrape: "true"
+          spec:
+            clusterIP: 10.96.0.10
+            selector:
+              k8s-app: kube-dns
+            ports:
+              - name: dns
+                port: 53
+                protocol: UDP
+                targetPort: 53
+              - name: dns-tcp
+                port: 53
+                protocol: TCP
+                targetPort: 53
+              - name: metrics
+                port: 9153
+                protocol: TCP
+                targetPort: 9153
+        '';
+
+        # ── image-preload systemd service ─────────────────────────────────────
+        # Runs after containerd is up, before kubelet starts.
+        # Imports all OCI tarballs from /var/lib/preload-images/ into
+        # containerd's k8s.io namespace so static pod images are available
+        # without any network access at cluster init time.
+        imagePreloadUnit = pkgs.writeText "image-preload.service" ''
+          [Unit]
+          Description=Preload bundled container images into containerd
+          After=containerd.service
+          Requires=containerd.service
+          Before=kubelet.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${containerd}/bin
+          ExecStartPre=/bin/sh -c 'until ctr version >/dev/null 2>&1; do sleep 1; done'
+          ExecStart=/bin/sh /usr/local/bin/preload-images.sh
+
+          [Install]
+          WantedBy=multi-user.target
+        '';
+
+        imagePreloadScript = pkgs.writeText "preload-images.sh" ''
+          #!/bin/sh
+          set -eu
+          PRELOAD_DIR=/var/lib/preload-images
+
+          if [ ! -d "$PRELOAD_DIR" ]; then
+            echo "image-preload: no preload directory found, skipping."
+            exit 0
+          fi
+
+          for tarball in "$PRELOAD_DIR"/*.tar; do
+            [ -f "$tarball" ] || continue
+            echo "image-preload: importing $tarball into containerd k8s.io namespace..."
+            ctr -n k8s.io images import "$tarball" \
+              && echo "image-preload: OK $tarball" \
+              || echo "image-preload: WARN failed to import $tarball"
+          done
+        '';
+
+        # ── cluster-bootstrap systemd service + path unit ──────────────────────
+        # The path unit watches for /etc/kubernetes/admin.conf to appear
+        # (written by just init's _gen-configs step) and triggers the service.
+        # This avoids boot-ordering issues — the service fires automatically
+        # whenever the kubeconfig is written, on every cluster init.
+        # kubectl apply is idempotent: safe to run on every boot.
+        clusterBootstrapUnit = pkgs.writeText "cluster-bootstrap.service" ''
+          [Unit]
+          Description=Apply core cluster bootstrap resources
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetesPatched}/bin
+          ExecStartPre=/bin/sh -c ' \
+            until kubectl \
+              --kubeconfig /etc/kubernetes/admin.conf \
+              get nodes >/dev/null 2>&1; do \
+              echo "cluster-bootstrap: waiting for apiserver..."; \
+              sleep 3; \
+            done'
+          ExecStart=/bin/sh -c 'kubectl \
+            --kubeconfig /etc/kubernetes/admin.conf \
+            apply -f /var/lib/cluster-bootstrap/kube-dns-service.yaml'
+
+          [Install]
+          WantedBy=multi-user.target
+        '';
+
+        clusterBootstrapPathUnit = pkgs.writeText "cluster-bootstrap.path" ''
+          [Unit]
+          Description=Watch for kubeconfig and trigger cluster bootstrap
+
+          [Path]
+          PathExists=/etc/kubernetes/admin.conf
+          Unit=cluster-bootstrap.service
+
+          [Install]
+          WantedBy=multi-user.target
+        '';
+
+        # ── systemd units derivation ──────────────────────────────────────────
         # pkgs.systemd does not ship unit files — they're generated by the NixOS
         # module system. We write the minimal set needed to boot in a container
         # as literal text, using canonical upstream unit file content.
@@ -642,7 +953,7 @@ PRETTY_NAME="nix-usernetes"
             socat
             util-linux
 
-            # All control plane components run as native systemd units — no container pulls
+            # All control plane components run as native systemd units
             kubernetesPatched
             etcd
             helm
@@ -651,8 +962,13 @@ PRETTY_NAME="nix-usernetes"
             systemdUnits
           ];
 
+          fakeRootCommands = ''
+            mkdir -p var/lib/preload-images
+            cp ${coreDNSImage} var/lib/preload-images/coredns.tar
+          '';
+
           extraCommands = ''
-            # containerd config — use systemd cgroup driver to match kubelet
+            # containerd config
             mkdir -p etc/containerd
             cp ${containerdConfig} etc/containerd/config.toml
 
@@ -670,7 +986,7 @@ PRETTY_NAME="nix-usernetes"
               ln -sf "$f" opt/cni/bin/$(basename "$f")
             done
 
-            # CNI config — bridge+host-local, no daemon required
+            # CNI config
             mkdir -p etc/cni/net.d
             cp ${cniConfig} etc/cni/net.d/10-u7s.conflist
 
@@ -682,28 +998,59 @@ PRETTY_NAME="nix-usernetes"
             # /etc/kubernetes is populated at runtime by just init
             mkdir -p etc/kubernetes/manifests etc/kubernetes/pki
 
-            # systemd units — all control plane components run as native systemd
-            # services using our Nix-built binaries. No container pulls, no pause
-            # images, no CNI needed for control plane.
+            # ── CoreDNS ────────────────────────────────────────────────────────
+            # Corefile — mounted as hostPath by the CoreDNS static pod
+            mkdir -p etc/coredns
+            cp ${coreDNSCorefile} etc/coredns/Corefile
+
+            # Static pod manifest — kubelet manages CoreDNS automatically
+            cp ${coreDNSManifest} etc/kubernetes/manifests/coredns.yaml
+
+            # ── Cluster bootstrap resources ────────────────────────────────────
+            # Applied by cluster-bootstrap.service after apiserver is ready.
+            mkdir -p var/lib/cluster-bootstrap
+            cp ${kubeDNSServiceManifest} var/lib/cluster-bootstrap/kube-dns-service.yaml
+
+            # ── Image preload script ───────────────────────────────────────────
+            mkdir -p usr/local/bin
+            cp ${imagePreloadScript} usr/local/bin/preload-images.sh
+            chmod +x usr/local/bin/preload-images.sh
+
+            # ── systemd units ──────────────────────────────────────────────────
             mkdir -p etc/systemd/system/multi-user.target.wants
+
             cp ${containerdUnit}        etc/systemd/system/containerd.service
             cp ${etcdUnit}              etc/systemd/system/etcd.service
             cp ${apiserverUnit}         etc/systemd/system/kube-apiserver.service
             cp ${controllerManagerUnit} etc/systemd/system/kube-controller-manager.service
             cp ${schedulerUnit}         etc/systemd/system/kube-scheduler.service
             cp ${kubeletUnit}           etc/systemd/system/kubelet.service
-            cp ${kubeProxyUnit} etc/systemd/system/kube-proxy.service
-            cp ${sysctlUnit} etc/systemd/system/u7s-sysctl.service
+            cp ${kubeProxyUnit}         etc/systemd/system/kube-proxy.service
+            cp ${sysctlUnit}            etc/systemd/system/u7s-sysctl.service
+            cp ${imagePreloadUnit}      etc/systemd/system/image-preload.service
+            cp ${clusterBootstrapUnit}  etc/systemd/system/cluster-bootstrap.service
+            cp ${clusterBootstrapPathUnit} etc/systemd/system/cluster-bootstrap.path
 
-            ln -sf /etc/systemd/system/kube-proxy.service etc/systemd/system/multi-user.target.wants/kube-proxy.service
-            ln -sf /etc/systemd/system/containerd.service         etc/systemd/system/multi-user.target.wants/containerd.service
-            ln -sf /etc/systemd/system/etcd.service                 etc/systemd/system/multi-user.target.wants/etcd.service
-            ln -sf /etc/systemd/system/kube-apiserver.service       etc/systemd/system/multi-user.target.wants/kube-apiserver.service
-            ln -sf /etc/systemd/system/kube-controller-manager.service etc/systemd/system/multi-user.target.wants/kube-controller-manager.service
-            ln -sf /etc/systemd/system/kube-scheduler.service       etc/systemd/system/multi-user.target.wants/kube-scheduler.service
-            ln -sf /etc/systemd/system/kubelet.service              etc/systemd/system/multi-user.target.wants/kubelet.service
-            ln -sf /etc/systemd/system/u7s-sysctl.service etc/systemd/system/multi-user.target.wants/u7s-sysctl.service
-
+            ln -sf /etc/systemd/system/containerd.service \
+              etc/systemd/system/multi-user.target.wants/containerd.service
+            ln -sf /etc/systemd/system/etcd.service \
+              etc/systemd/system/multi-user.target.wants/etcd.service
+            ln -sf /etc/systemd/system/kube-apiserver.service \
+              etc/systemd/system/multi-user.target.wants/kube-apiserver.service
+            ln -sf /etc/systemd/system/kube-controller-manager.service \
+              etc/systemd/system/multi-user.target.wants/kube-controller-manager.service
+            ln -sf /etc/systemd/system/kube-scheduler.service \
+              etc/systemd/system/multi-user.target.wants/kube-scheduler.service
+            ln -sf /etc/systemd/system/kubelet.service \
+              etc/systemd/system/multi-user.target.wants/kubelet.service
+            ln -sf /etc/systemd/system/kube-proxy.service \
+              etc/systemd/system/multi-user.target.wants/kube-proxy.service
+            ln -sf /etc/systemd/system/u7s-sysctl.service \
+              etc/systemd/system/multi-user.target.wants/u7s-sysctl.service
+            ln -sf /etc/systemd/system/image-preload.service \
+              etc/systemd/system/multi-user.target.wants/image-preload.service
+            ln -sf /etc/systemd/system/cluster-bootstrap.path \
+              etc/systemd/system/multi-user.target.wants/cluster-bootstrap.path
 
             # Standard dirs
             mkdir -p var/lib/kubelet var/lib/etcd
@@ -748,57 +1095,65 @@ PRETTY_NAME="nix-usernetes"
           destination = "/usr/local/bin/u7s-debug";
           text = ''
             #!/usr/bin/env nu
-        
+
             def section [title: string] {
               print $"\n(ansi green_bold)══ ($title) ══(ansi reset)"
             }
-        
+
             def main [] {
               section "Interfaces & Addresses"
               ip addr show
-        
+
               section "Routing Tables"
               ip route show table all
-        
+
               section "ARP / Neighbor Table"
               ip neigh show
-        
+
               section "iptables NAT PREROUTING"
               iptables -t nat -L PREROUTING -n -v
-        
+
               section "iptables NAT POSTROUTING"
               iptables -t nat -L POSTROUTING -n -v
-        
+
               section "iptables NAT KUBE-SERVICES"
               iptables -t nat -L KUBE-SERVICES -n -v
-        
+
               section "nftables ruleset (nat table)"
               nft list table ip nat
-        
-              section "nftables ruleset (filter table)"  
+
+              section "nftables ruleset (filter table)"
               nft list table ip filter
-        
+
               section "Conntrack table (first 20)"
               conntrack -L 2>/dev/null | head -20
-        
+
               section "Interface packet counters"
               cat /proc/net/dev
-        
+
               section "Connectivity: apiserver (10.96.0.1:443)"
               curl --max-time 3 -sk https://10.96.0.1:443 | from json | get kind
-        
+
               section "Connectivity: internet (1.1.1.1)"
               let result = (curl --max-time 3 -sI http://1.1.1.1 | lines | first)
               print $result
-        
+
               section "Pod CIDR routes"
               ip route show | where ($it | str contains "10.244")
-        
+
               section "Done"
             }
           '';
         };
-        
+
+        debugEtc = pkgs.runCommand "debug-etc" {} ''
+          mkdir -p $out/etc
+          echo "root:x:0:0:root:/root:/bin/sh" > $out/etc/passwd
+          echo "root:x:0:" > $out/etc/group
+          echo "root:!:19000:0:99999:7:::" > $out/etc/shadow
+          mkdir -p $out/root
+        '';
+
         debugImage = pkgs.dockerTools.buildLayeredImage {
           name = "nix-usernetes-debug";
           tag  = "latest";
@@ -830,7 +1185,6 @@ PRETTY_NAME="nix-usernetes"
             for f in etc/passwd etc/group etc/shadow; do
               if [ -L "$f" ]; then
                 target=$(readlink "$f")
-                # Make relative: strip leading / and compute relative path from /etc
                 reltarget=$(echo "$target" | sed 's|^/|../../|')
                 rm "$f"
                 ln -sf "$reltarget" "$f"
@@ -846,14 +1200,6 @@ PRETTY_NAME="nix-usernetes"
             ];
           };
         };
-
-        debugEtc = pkgs.runCommand "debug-etc" {} ''
-          mkdir -p $out/etc
-          echo "root:x:0:0:root:/root:/bin/sh" > $out/etc/passwd
-          echo "root:x:0:" > $out/etc/group
-          echo "root:!:19000:0:99999:7:::" > $out/etc/shadow
-          mkdir -p $out/root
-        '';
 
       in {
         packages = {

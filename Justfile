@@ -5,11 +5,19 @@
 # Prerequisites: podman, just, openssl, jq
 #
 # Quickstart:
-#   just up       # start the container (systemd + containerd + kubelet)
-#   just init     # generate PKI and static pod manifests (first time only)
+#   nix build .#node-image -o result-node-image
+#   just load-node-image
+#   just up
+#   just init
 #   just kubeconfig
 #   export KUBECONFIG=$(pwd)/kubeconfig
-#   kubectl get pods -A
+#
+# CoreDNS is baked into the node image and starts automatically as a static
+# pod. No manual DNS setup is required after `just init`.
+#
+# cert-manager is a Polar concern, not cluster infrastructure. Install it
+# from the Polar project context:
+#   just install-cert-manager   # run from this directory before deploying Polar
 
 # ── configuration ─────────────────────────────────────────────────────────────
 
@@ -76,7 +84,7 @@ shell:
 # Show status of Kubernetes components inside the node.
 status:
     @echo "=== systemd units ==="
-    podman exec {{CONTAINER}} systemctl status containerd kubelet --no-pager || true
+    podman exec {{CONTAINER}} systemctl status containerd kubelet image-preload cluster-bootstrap --no-pager || true
     @echo ""
     @echo "=== static pods ==="
     podman exec {{CONTAINER}} \
@@ -85,11 +93,17 @@ status:
 # ── cluster bootstrap (run once after first `just up`) ───────────────────────
 
 # Generate PKI, configs, and static pod manifests. Safe to re-run.
-init: _gen-pki _gen-configs _gen-apiserver-env _untaint _prepull-images _install-cert-manager
+# CoreDNS starts automatically via static pod — no manual DNS setup needed.
+# cert-manager is NOT installed here — it is a Polar concern.
+# Run `just install-cert-manager` separately before deploying Polar.
+init: _gen-pki _gen-configs _gen-apiserver-env _untaint _prepull-images
     @echo ""
     @echo "✓ Cluster initialised. Run 'just kubeconfig' then:"
     @echo "  export KUBECONFIG=$(pwd)/kubeconfig"
     @echo "  kubectl get pods -A"
+    @echo ""
+    @echo "CoreDNS will start automatically as a static pod."
+    @echo "Run 'just install-cert-manager' before deploying Polar."
 
 # Extract kubeconfig (replaces node name with 127.0.0.1 for local access).
 kubeconfig: _check-running
@@ -149,27 +163,27 @@ _gen-pki: _check-running
             rm -f "${dir}/${name}.csr"
         }
 
-        # ── CA certs ──────────────────────────────────────────────────────
+        # ── CA certs ──────────────────────────────────────────────────
         gen_ca /etc/kubernetes/pki ca
         gen_ca /etc/kubernetes/pki/etcd ca
         gen_ca /etc/kubernetes/pki front-proxy-ca
 
-        # ── apiserver cert ────────────────────────────────────────────────
+        # ── apiserver cert ────────────────────────────────────────────
         gen_cert /etc/kubernetes/pki ca \
             /etc/kubernetes/pki apiserver kube-apiserver \
             "subjectAltName=DNS:localhost,DNS:${NODE_NAME},DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.cluster.local,IP:127.0.0.1,IP:10.96.0.1,IP:${CONTAINER_IP}"
 
-        # ── apiserver→kubelet client cert ─────────────────────────────────
+        # ── apiserver→kubelet client cert ─────────────────────────────
         gen_cert /etc/kubernetes/pki ca \
             /etc/kubernetes/pki apiserver-kubelet-client kube-apiserver-kubelet-client \
             "subjectAltName=DNS:${NODE_NAME}"
 
-        # ── front-proxy client cert ───────────────────────────────────────
+        # ── front-proxy client cert ───────────────────────────────────
         gen_cert /etc/kubernetes/pki front-proxy-ca \
             /etc/kubernetes/pki front-proxy-client front-proxy-client \
             "subjectAltName=DNS:${NODE_NAME}"
 
-        # ── etcd certs ────────────────────────────────────────────────────
+        # ── etcd certs ────────────────────────────────────────────────
         gen_cert /etc/kubernetes/pki/etcd ca \
             /etc/kubernetes/pki/etcd server etcd-server \
             "subjectAltName=DNS:localhost,DNS:${NODE_NAME},IP:127.0.0.1"
@@ -182,27 +196,27 @@ _gen-pki: _check-running
             /etc/kubernetes/pki apiserver-etcd-client apiserver-etcd-client \
             "subjectAltName=DNS:${NODE_NAME}"
 
-        # ── service account key pair ──────────────────────────────────────
+        # ── service account key pair ──────────────────────────────────
         openssl genrsa -out /etc/kubernetes/pki/sa.key 2048
         openssl rsa -in /etc/kubernetes/pki/sa.key \
             -pubout -out /etc/kubernetes/pki/sa.pub
 
-        # ── admin client cert (for kubeconfig) ────────────────────────────
+        # ── admin client cert (for kubeconfig) ────────────────────────
         gen_cert /etc/kubernetes/pki ca \
             /etc/kubernetes/pki admin kubernetes-admin \
             "subjectAltName=DNS:${NODE_NAME}"
 
-        # ── controller-manager client cert ────────────────────────────────
+        # ── controller-manager client cert ────────────────────────────
         gen_cert /etc/kubernetes/pki ca \
             /etc/kubernetes/pki controller-manager-client system:kube-controller-manager \
             "subjectAltName=DNS:${NODE_NAME}"
 
-        # ── scheduler client cert ─────────────────────────────────────────
+        # ── scheduler client cert ─────────────────────────────────────
         gen_cert /etc/kubernetes/pki ca \
             /etc/kubernetes/pki scheduler-client system:kube-scheduler \
             "subjectAltName=DNS:${NODE_NAME}"
 
-        # ── kubelet client cert ───────────────────────────────────────────
+        # ── kubelet client cert ───────────────────────────────────────
         gen_cert /etc/kubernetes/pki ca \
             /etc/kubernetes/pki kubelet-client "system:node:${NODE_NAME}" \
             "subjectAltName=DNS:${NODE_NAME},IP:127.0.0.1"
@@ -219,11 +233,9 @@ _gen-configs: _check-running
         exit 0
     fi
     echo "Generating kubeconfigs..."
-
     write_kubeconfig() {
-        local dest="$1" user="$2" cert="$3" key="$4"
-        local ca cert_data key_data apiserver
-        apiserver="https://{{NODE_NAME}}:{{PORT_APISERVER}}"
+        local dest="$1" user="$2" cert="$3" key="$4" server="$5"
+        local ca cert_data key_data
         ca=$(podman exec {{CONTAINER}} base64 -w0 /etc/kubernetes/pki/ca.crt)
         cert_data=$(podman exec {{CONTAINER}} base64 -w0 /etc/kubernetes/pki/${cert}.crt)
         key_data=$(podman exec {{CONTAINER}} base64 -w0 /etc/kubernetes/pki/${key}.key)
@@ -233,7 +245,7 @@ _gen-configs: _check-running
         yaml+="clusters:"$'\n'
         yaml+="- cluster:"$'\n'
         yaml+="    certificate-authority-data: ${ca}"$'\n'
-        yaml+="    server: ${apiserver}"$'\n'
+        yaml+="    server: ${server}"$'\n'
         yaml+="  name: kubernetes"$'\n'
         yaml+="contexts:"$'\n'
         yaml+="- context:"$'\n'
@@ -248,16 +260,17 @@ _gen-configs: _check-running
         yaml+="    client-key-data: ${key_data}"$'\n'
         printf '%s' "$yaml" | podman exec -i {{CONTAINER}} bash -c "cat > ${dest}"
     }
-
     write_kubeconfig /etc/kubernetes/admin.conf \
-        kubernetes-admin admin admin
+        kubernetes-admin admin admin "https://{{NODE_NAME}}:{{PORT_APISERVER}}"
+    CONTAINER_IP=$(podman exec {{CONTAINER}} ip -4 addr show tap0 | grep "inet " | head -1 | sed 's|.*inet \([0-9.]*\)/.*|\1|')
+    write_kubeconfig /etc/kubernetes/coredns.conf \
+    kubernetes-admin admin admin "https://${CONTAINER_IP}:{{PORT_APISERVER}}"
     write_kubeconfig /etc/kubernetes/controller-manager.conf \
-        system:kube-controller-manager controller-manager-client controller-manager-client
+        system:kube-controller-manager controller-manager-client controller-manager-client "https://{{NODE_NAME}}:{{PORT_APISERVER}}"
     write_kubeconfig /etc/kubernetes/scheduler.conf \
-        system:kube-scheduler scheduler-client scheduler-client
+        system:kube-scheduler scheduler-client scheduler-client "https://{{NODE_NAME}}:{{PORT_APISERVER}}"
     write_kubeconfig /etc/kubernetes/kubelet.conf \
-        "system:node:{{NODE_NAME}}" kubelet-client kubelet-client
-
+        "system:node:{{NODE_NAME}}" kubelet-client kubelet-client "https://{{NODE_NAME}}:{{PORT_APISERVER}}"
     echo "Kubeconfigs written."
 
 # Patch the apiserver unit with the actual CONTAINER_IP and restart services.
@@ -274,7 +287,7 @@ _gen-apiserver-env: _check-running
         "s/--advertise-address=\$HOST_IP/--advertise-address=${CONTAINER_IP}/g" \
         /etc/systemd/system/kube-apiserver.service
     podman exec {{CONTAINER}} systemctl daemon-reload
-    podman exec {{CONTAINER}} systemctl restart etcd kube-apiserver kube-controller-manager kube-scheduler kubelet 2>/dev/null || true
+    podman exec {{CONTAINER}} systemctl restart --no-block etcd kube-apiserver kube-controller-manager kube-scheduler kubelet 2>/dev/null || true
     echo "Control plane services restarted."
 
 # Wait for apiserver and remove the control-plane taint so pods schedule on this node.
@@ -304,11 +317,42 @@ _untaint: _check-running
     echo "Node untainted — workloads will schedule."
 
 # Pre-pull images into the cluster containerd. Uses local podman cache if available.
+# CoreDNS is bundled in the node image itself and does not need to be listed here.
 _prepull-images: _check-running
     #!/usr/bin/env bash
     set -euo pipefail
     for img in \
-        registry.k8s.io/pause:3.10 \
+        registry.k8s.io/pause:3.10; do
+        if podman exec {{CONTAINER}} ctr -n k8s.io images check "$img" &>/dev/null; then
+            echo "Image $img already in cluster, skipping."
+            continue
+        fi
+        if ! podman image exists "$img" 2>/dev/null; then
+            echo "Pulling $img into local cache..."
+            podman pull "$img"
+        fi
+        echo "Loading $img into cluster..."
+        podman save "$img" | podman exec -i {{CONTAINER}} ctr -n k8s.io images import -
+    done
+
+# ── cert-manager (Polar concern) ──────────────────────────────────────────────
+
+# Install cert-manager into the cluster.
+# cert-manager is required by Polar but is not permanent cluster infrastructure.
+# Call this once after `just init` before deploying Polar.
+# Images are loaded from local podman cache — pull them first if not present:
+#   podman pull quay.io/jetstack/cert-manager-controller:v1.19.2
+#   podman pull quay.io/jetstack/cert-manager-cainjector:v1.19.2
+#   podman pull quay.io/jetstack/cert-manager-webhook:v1.19.2
+install-cert-manager: _check-running
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if podman exec {{CONTAINER}} kubectl --kubeconfig /etc/kubernetes/admin.conf \
+        get namespace cert-manager &>/dev/null; then
+        echo "cert-manager already installed, skipping."
+        exit 0
+    fi
+    for img in \
         quay.io/jetstack/cert-manager-controller:v1.19.2 \
         quay.io/jetstack/cert-manager-cainjector:v1.19.2 \
         quay.io/jetstack/cert-manager-webhook:v1.19.2; do
@@ -323,18 +367,9 @@ _prepull-images: _check-running
         echo "Loading $img into cluster..."
         podman save "$img" | podman exec -i {{CONTAINER}} ctr -n k8s.io images import -
     done
-
-# Install cert-manager into the cluster. Idempotent.
-_install-cert-manager: _check-running
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if podman exec {{CONTAINER}} kubectl --kubeconfig /etc/kubernetes/admin.conf \
-        get namespace cert-manager &>/dev/null; then
-        echo "cert-manager already installed, skipping."
-        exit 0
-    fi
     podman exec {{CONTAINER}} kubectl --kubeconfig /etc/kubernetes/admin.conf \
         apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.19.2/cert-manager.yaml
+    echo "cert-manager installed."
 
 # ── pod debugging tools ───────────────────────────────────────────────────────
 
@@ -378,3 +413,8 @@ debug-pod pod: _check-running
     NETNS=$(podman exec {{CONTAINER}} sh -c "crictl --runtime-endpoint unix:///run/containerd/containerd.sock pods --namespace $NS --name $NAME -q 2>/dev/null | xargs -I{} crictl --runtime-endpoint unix:///run/containerd/containerd.sock inspectp {} 2>/dev/null | jq -r '.info.runtimeSpec.linux.namespaces[] | select(.type==\"network\") | .path'")
     echo "Pod netns: $NETNS"
     KUBECONFIG={{_u7s_kubeconf}} kubectl exec u7s-debug -- nsenter --net=$NETNS /usr/local/bin/u7s-debug
+
+# Load the node image into podman after a `nix build`.
+# Run this after every `nix build .#node-image -o result-node-image`.
+load-node-image:
+    podman load -i result-node-image
