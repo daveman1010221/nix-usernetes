@@ -1227,9 +1227,15 @@ PRETTY_NAME="nix-usernetes"
           ];
           shellHook = ''
             echo "nix-usernetes dev shell"
+            echo ""
+            echo "  nix build .#node-image -o result-node-image   — build node image"
+            echo "  just load-node-image                          — load image into podman"
+            echo "  just reset && just up && just init            — cycle the cluster"
+            echo "  just kubeconfig                               — write kubeconfig"
+            echo "  just install-cert-manager                     — Polar prereq"
+            echo ""
             echo "  nix build .#kubernetes    — build patched K8s binaries only"
-            echo "  nix build .#node-image    — build full OCI node image"
-            echo "  nix build                  — same as .#node-image"
+            echo "  nix build .#debug-image   — build debug image"
           '';
         };
       }
