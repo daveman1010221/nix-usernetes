@@ -926,6 +926,7 @@ PRETTY_NAME="nix-usernetes"
         nodeImage = pkgs.dockerTools.buildLayeredImage {
           name = "nix-usernetes-node";
           tag  = k8sVersion;
+          maxLayers = 20;
 
           contents = pkgs.lib.flatten [
             bash
