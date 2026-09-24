@@ -429,7 +429,7 @@
         containerdConfig = pkgs.writeText "containerd-config.toml" ''
           version = 3
           [plugins."io.containerd.cri.v1.runtime"]
-            sandbox_image = "registry.k8s.io/pause:3.10"
+            sandbox_image = "registry.k8s.io/pause:3.10.1"
             restrict_oom_score_adj = true
             [plugins."io.containerd.cri.v1.runtime".cni]
               bin_dirs = ["/opt/cni/bin"]
@@ -441,6 +441,19 @@
                 [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
                   SystemdCgroup = false
                   NoPivotRoot = true
+          [plugins."io.containerd.cri.v1.images".registry]
+            config_path = "/etc/containerd/certs.d"
+        '';
+
+        # hosts.toml for the local dev registry (polar-registry, run on the
+        # host via `just registry-up`). u7s reaches the host through its
+        # slirp4netns gateway at 10.0.2.2 -- this tells containerd that
+        # endpoint is a plain-HTTP registry, not a misconfigured HTTPS one.
+        localRegistryHostsToml = pkgs.writeText "hosts.toml" ''
+          server = "http://10.0.2.2:5000"
+
+          [host."http://10.0.2.2:5000"]
+            capabilities = ["pull", "resolve"]
         '';
 
         sysctlConfig = pkgs.writeText "99-u7s.conf" ''
@@ -972,7 +985,8 @@ PRETTY_NAME="nix-usernetes"
             # containerd config
             mkdir -p etc/containerd
             cp ${containerdConfig} etc/containerd/config.toml
-
+            mkdir -p etc/containerd/certs.d/10.0.2.2:5000
+            cp ${localRegistryHostsToml} etc/containerd/certs.d/10.0.2.2:5000/hosts.toml
             mkdir -p etc/sysctl.d
             cp ${sysctlConfig} etc/sysctl.d/99-u7s.conf
 
