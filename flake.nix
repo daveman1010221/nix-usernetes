@@ -509,8 +509,18 @@
 
         # ── CoreDNS Corefile ──────────────────────────────────────────────────
         # Mounted as a hostPath volume by the CoreDNS static pod.
-        # Forwards upstream DNS to 10.0.2.3, the slirp4netns virtual gateway,
-        # which forwards to the host resolver stack.
+        # Forwards upstream DNS to 10.0.2.2:5300: 10.0.2.2 is the host, as
+        # slirp4netns presents it (its gateway), so this is the host's
+        # 127.0.0.1:5300, a second listener of systemd-resolved
+        # (services.resolved.settings.Resolve.DNSStubListenerExtra on the host).
+        # The cluster therefore asks the host's own resolver, and follows it
+        # when the VPN, the network or the upstream changes, without leaking
+        # queries to a resolver of our choosing.
+        #
+        # Not slirp4netns's built-in DNS at 10.0.2.3: it did not answer from
+        # inside the node (no reply to a query sent from the node container,
+        # while the host's resolvers answered), so nothing resolved names
+        # outside the cluster.
         coreDNSCorefile = pkgs.writeText "Corefile" ''
           .:53 {
               errors
@@ -524,7 +534,7 @@
                   ttl 30
                   kubeconfig /etc/kubernetes/coredns.conf kubernetes-admin@kubernetes
               }
-              forward . 10.0.2.3
+              forward . 10.0.2.2:5300
               cache 30
               loop
               reload
