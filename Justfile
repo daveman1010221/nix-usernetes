@@ -34,11 +34,15 @@ PORT_KUBELET   := "10250"
 # ── core lifecycle ────────────────────────────────────────────────────────────
 
 # Start the node container. Idempotent.
+# --dns-search=. keeps the host's search domain out of the node's resolv.conf. Kubelet copies that file into every pod,
+# and with ndots:5 a host domain (a corporate or wifi one) is tried before the real name; when the host's resolver does
+# not answer it, every lookup waits out CoreDNS's 5 s upstream timeout and clients with shorter budgets give up.
 up:
     podman run -d \
         --name {{CONTAINER}} \
         --hostname {{NODE_NAME}} \
         --network slirp4netns:allow_host_loopback=true \
+        --dns-search=. \
         --privileged \
         --pids-limit -1 \
         --cgroupns=private \
