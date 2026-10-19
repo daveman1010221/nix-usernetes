@@ -410,6 +410,10 @@
           cgroupDriver: cgroupfs
           cgroupsPerQOS: false
           enforceNodeAllocatable: []
+          # The kubelet limits registry requests to 5 a second with a burst of 10, and a pull policy of Always makes one for every container
+          # that starts: 24 pods at once are throttled ("pull QPS exceeded"), retried with a backoff, and take 18 s to run instead of 1.3 s.
+          # This node pulls from a registry on its own host, so there is nothing to protect: 0 is no limit.
+          registryPullQPS: 0
           containerRuntimeEndpoint: "unix:///run/containerd/containerd.sock"
           staticPodPath: /etc/kubernetes/manifests
           clusterDNS:
