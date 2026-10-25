@@ -15,16 +15,15 @@
         };
 
         # ── versioning ────────────────────────────────────────────────────────
-        k8sVersion     = "1.33.10";
+        # Kubernetes vendors cAdvisor, which only reports filesystems of a type
+        # it knows. Up to 1.35 (cAdvisor v0.53.0) f2fs was not one of them and
+        # the kubelet failed on f2fs hosts, so this flake swapped in a patched
+        # fork; since 1.36 (cAdvisor v0.56.2) its VFS plugin handles f2fs.
+        k8sVersion     = "1.37.1";
         k8sTag         = "v${k8sVersion}";
-        k8sSha256      = "sha256-pN06vX2i9PUP/nlYNoKh+ZCFaQO10gCUjBLmnmMt2P8=";
+        k8sMinor       = builtins.elemAt (pkgs.lib.splitString "." k8sVersion) 1;
+        k8sSha256      = "sha256-iSlaw3XrD9/migaW2BvmFXcdayfHrZu2ddxv/Q0s5fM=";
         coreDNSVersion = "1.12.1";
-
-        # Our patched cAdvisor fork (adds "f2fs": true to supportedFsType map)
-        cadvisorForkOwner  = "daveman1010221";
-        cadvisorForkBranch = "fix-f2fs-v0.52.1";
-        cadvisorForkRev    = "v0.52.2-f2fs";
-        cadvisorForkSha256 = "sha256-E4ikMWyfapmTbgD8Y359n0Cx953SY2mDy/QDRgLUnMU=";
 
         # ── CoreDNS OCI image ─────────────────────────────────────────────────
         # Fetched by Nix at build time and bundled into the node image.
@@ -71,23 +70,15 @@
 
         cniPlugins = pkgs.cni-plugins;
 
-        # ── patched cAdvisor source ───────────────────────────────────────────
-        cadvisorPatchedSrc = pkgs.fetchFromGitHub {
-          owner  = cadvisorForkOwner;
-          repo   = "cadvisor";
-          rev    = cadvisorForkRev;
-          sha256 = cadvisorForkSha256;
-        };
-
         # ── Kubernetes source ─────────────────────────────────────────────────
         kubernetesSrc = pkgs.fetchurl {
           url    = "https://github.com/kubernetes/kubernetes/archive/refs/tags/${k8sTag}.tar.gz";
           sha256 = k8sSha256;
         };
 
-        # ── kubelet (+ friends) built from source with patched cAdvisor ───────
-        kubernetesPatched = pkgs.stdenv.mkDerivation rec {
-          pname   = "kubernetes-patched";
+        # ── kubelet (+ friends) built from source ─────────────────────────────
+        kubernetes = pkgs.stdenv.mkDerivation rec {
+          pname   = "kubernetes";
           version = k8sVersion;
 
           src = kubernetesSrc;
@@ -123,42 +114,13 @@
 
           KUBE_GIT_VERSION    = k8sTag;
           KUBE_GIT_MAJOR      = "1";
-          KUBE_GIT_MINOR      = "33";
-          KUBE_GIT_COMMIT     = "nix-patched-cadvisor";
+          KUBE_GIT_MINOR      = k8sMinor;
+          KUBE_GIT_COMMIT     = "nix-usernetes";
           KUBE_GIT_TREE_STATE = "clean";
 
           configurePhase = ''
             runHook preConfigure
-
             mkdir -p "$HOME" "$GOPATH"
-
-            # ── Inject our patched cAdvisor into the vendor tree ───────────────
-            # Replace vendor/github.com/google/cadvisor/ with our fork's code,
-            # but leave go.mod and vendor/modules.txt UNCHANGED — both still
-            # declare "github.com/google/cadvisor v0.52.1".
-            #
-            # Go's -mod=vendor consistency check only validates that version
-            # strings are consistent across go.mod <-> modules.txt. It does NOT
-            # hash the actual source files inside vendor/. Swapping the code
-            # while keeping the declared version at v0.52.1 passes all checks.
-            CADVISOR_VENDOR="vendor/github.com/google/cadvisor"
-
-            echo "Replacing vendored cadvisor code with patched fork (${cadvisorForkRev})..."
-            echo "  (keeping declared version as v0.52.1 to satisfy go.mod consistency)"
-            rm -rf "$CADVISOR_VENDOR"
-            cp -r --no-preserve=mode,ownership "${cadvisorPatchedSrc}" "$CADVISOR_VENDOR"
-
-            # Belt-and-suspenders: verify strings are still consistent
-            GO_MOD_VER=$(grep 'google/cadvisor' go.mod | grep -v '//' | awk '{print $2}')
-            MODULES_TXT_VER=$(grep '# github.com/google/cadvisor' vendor/modules.txt | awk '{print $3}')
-            echo "  go.mod version:      $GO_MOD_VER"
-            echo "  vendor/modules.txt:  $MODULES_TXT_VER"
-            if [ "$GO_MOD_VER" != "$MODULES_TXT_VER" ]; then
-              echo "ERROR: cadvisor version mismatch between go.mod and vendor/modules.txt"
-              exit 1
-            fi
-            echo "  ✓ Version strings consistent — vendor injection OK"
-
             runHook postConfigure
           '';
 
@@ -182,13 +144,13 @@
                 -ldflags "
                   -X k8s.io/client-go/pkg/version.gitVersion=${k8sTag}
                   -X k8s.io/client-go/pkg/version.gitMajor=1
-                  -X k8s.io/client-go/pkg/version.gitMinor=33
-                  -X k8s.io/client-go/pkg/version.gitCommit=nix-patched-cadvisor
+                  -X k8s.io/client-go/pkg/version.gitMinor=${k8sMinor}
+                  -X k8s.io/client-go/pkg/version.gitCommit=nix-usernetes
                   -X k8s.io/client-go/pkg/version.gitTreeState=clean
                   -X k8s.io/component-base/version.gitVersion=${k8sTag}
                   -X k8s.io/component-base/version.gitMajor=1
-                  -X k8s.io/component-base/version.gitMinor=33
-                  -X k8s.io/component-base/version.gitCommit=nix-patched-cadvisor
+                  -X k8s.io/component-base/version.gitMinor=${k8sMinor}
+                  -X k8s.io/component-base/version.gitCommit=nix-usernetes
                   -X k8s.io/component-base/version.gitTreeState=clean
                   -w -s
                 " \
@@ -207,7 +169,7 @@
           '';
 
           meta = {
-            description = "Kubernetes binaries patched with f2fs-aware cAdvisor";
+            description = "Kubernetes binaries, built statically from source";
             platforms   = [ "x86_64-linux" ];
           };
         };
@@ -272,7 +234,7 @@
 
           [Service]
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/pki/apiserver.crt; do sleep 2; done'
-          ExecStart=${kubernetesPatched}/bin/kube-apiserver \
+          ExecStart=${kubernetes}/bin/kube-apiserver \
             --advertise-address=$HOST_IP \
             --bind-address=0.0.0.0 \
             --allow-privileged=true \
@@ -316,7 +278,7 @@
 
           [Service]
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/controller-manager.conf; do sleep 2; done'
-          ExecStart=${kubernetesPatched}/bin/kube-controller-manager \
+          ExecStart=${kubernetes}/bin/kube-controller-manager \
             --allocate-node-cidrs=true \
             --cluster-cidr=10.244.0.0/16 \
             --cluster-name=kubernetes \
@@ -344,7 +306,7 @@
 
           [Service]
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/scheduler.conf; do sleep 2; done'
-          ExecStart=${kubernetesPatched}/bin/kube-scheduler \
+          ExecStart=${kubernetes}/bin/kube-scheduler \
             --kubeconfig=/etc/kubernetes/scheduler.conf \
             --leader-elect=false
           Restart=always
@@ -363,10 +325,10 @@
           Requires=containerd.service
 
           [Service]
-          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetesPatched}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin
+          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetes}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin
           ExecStartPre=/bin/sh -c 'grep -q u7s-node /etc/hosts || echo "127.0.0.1 u7s-node" >> /etc/hosts'
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/kubelet.conf; do sleep 2; done'
-          ExecStart=${kubernetesPatched}/bin/kubelet \
+          ExecStart=${kubernetes}/bin/kubelet \
             --config=/etc/kubelet/kubelet-config.yaml \
             --kubeconfig=/etc/kubernetes/kubelet.conf \
             --v=2
@@ -383,8 +345,8 @@
           Description=kube-proxy
           After=network.target kube-apiserver.service
           [Service]
-          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetesPatched}/bin:${pkgs.nftables}/bin
-          ExecStart=${kubernetesPatched}/bin/kube-proxy \
+          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetes}/bin:${pkgs.nftables}/bin
+          ExecStart=${kubernetes}/bin/kube-proxy \
             --kubeconfig=/etc/kubernetes/admin.conf \
             --proxy-mode=iptables \
             --cluster-cidr=10.244.0.0/24 \
@@ -716,7 +678,7 @@
           [Service]
           Type=oneshot
           RemainAfterExit=yes
-          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetesPatched}/bin
+          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetes}/bin
           ExecStartPre=/bin/sh -c ' \
             until kubectl \
               --kubeconfig /etc/kubernetes/admin.conf \
@@ -982,7 +944,7 @@ PRETTY_NAME="nix-usernetes"
             util-linux
 
             # All control plane components run as native systemd units
-            kubernetesPatched
+            kubernetes
             etcd
             helm
 
@@ -1098,7 +1060,7 @@ PRETTY_NAME="nix-usernetes"
               "container=docker"
               "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
               "SSL_CERT_DIR=/etc/ssl/certs"
-              "PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetesPatched}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin"
+              "PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetes}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin"
               "KUBECONFIG=/etc/kubernetes/admin.conf"
             ];
             Volumes = {
@@ -1232,7 +1194,7 @@ PRETTY_NAME="nix-usernetes"
 
       in {
         packages = {
-          kubernetes  = kubernetesPatched;
+          kubernetes  = kubernetes;
           node-image  = nodeImage;
           debug-image = debugImage;
           default     = nodeImage;

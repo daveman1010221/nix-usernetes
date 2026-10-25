@@ -13,14 +13,13 @@ failed to get rootfs info: failed to get mount point for device
 "/dev/mapper/nix-home": no partition info for device
 ```
 
-The fix is a one-line change (`"f2fs": true`) that hasn't propagated into any upstream release. Rather than wait, this project builds all Kubernetes components from source in Nix with the patch applied.
+The fix was a one-line change (`"f2fs": true`) that hadn't reached any upstream release, so this project built all Kubernetes components from source in Nix with the patch applied. Kubernetes 1.36 fixed it upstream: its cAdvisor (v0.56.2) looks filesystems up through plugins, and the VFS plugin handles f2fs. Since 1.37 the build uses Kubernetes' vendored cAdvisor unchanged.
 
 ## What it builds
 
 A layered OCI container image containing:
 
-- **kubelet, kube-apiserver, kube-controller-manager, kube-scheduler, kubectl, kube-proxy** — built from source at K8s 1.33.10
-- **Patched cAdvisor** — vendored into kubelet via source tree injection; fork at [`daveman1010221/cadvisor@v0.52.2-f2fs`](https://github.com/daveman1010221/cadvisor/tree/fix-f2fs-v0.52.1)
+- **kubelet, kube-apiserver, kube-controller-manager, kube-scheduler, kubectl, kube-proxy** — built from source at K8s 1.37.1, as static binaries (`CGO_ENABLED=0`)
 - **etcd** — from nixpkgs, run as a native systemd unit
 - **containerd, runc, cri-tools, cni-plugins** — from nixpkgs
 - **systemd as PID 1** — required for proper cgroup management inside the container
@@ -91,17 +90,15 @@ just reset       # stop container and wipe all state
 
 ```
 flake.nix
-├── kubernetesPatched  (stdenv.mkDerivation)
-│   ├── src: kubernetes-v1.33.10.tar.gz
-│   ├── cadvisorPatchedSrc: daveman1010221/cadvisor@v0.52.2-f2fs
-│   ├── configurePhase: replaces vendor/github.com/google/cadvisor/
+├── kubernetes  (stdenv.mkDerivation)
+│   ├── src: kubernetes-v1.37.1.tar.gz
 │   └── buildPhase: go build -mod=vendor CGO_ENABLED=0
 │
 └── nodeImage  (dockerTools.buildLayeredImage)
     ├── systemd as PID 1
     ├── containerd + runc + cri-tools
     ├── etcd (nixpkgs)
-    ├── kubernetesPatched binaries
+    ├── kubernetes binaries
     └── systemd units for all control plane components
 ```
 
@@ -113,18 +110,13 @@ flake.nix
 5. Wait for apiserver readiness
 6. Remove control-plane taint so workloads schedule
 
-## Patched cAdvisor
-
-K8s 1.33 vendors cAdvisor at `v0.52.1`. The patch adds `"f2fs": true` to the `supportedFsType` map in `fs/fs.go`. The patched fork is at [`daveman1010221/cadvisor`](https://github.com/daveman1010221/cadvisor), branch `fix-f2fs-v0.52.1`, tag `v0.52.2-f2fs`.
-
-The vendor injection keeps the declared version at `v0.52.1` in both `go.mod` and `vendor/modules.txt` — Go's `-mod=vendor` only validates version string consistency, not file content hashes.
-
 ## Updating Kubernetes versions
 
-1. Update `k8sVersion` in `flake.nix`
-2. Run `./prefetch-hashes.sh` to get new SHA256 values
-3. Check the vendored cAdvisor version: `grep cadvisor go.mod`
-4. If changed, rebase the cAdvisor fork and update `cadvisorForkRev`
+1. Update `k8sVersion` in `flake.nix`, and the image tag in `IMAGE` in the `Justfile`
+2. Get the new source hash and put it in `k8sSha256`:
+   `nix store prefetch-file --json https://github.com/kubernetes/kubernetes/archive/refs/tags/v<version>.tar.gz | jq -r .hash`
+3. Check the release's `go.mod` Go version against nixpkgs' `go`, and run `nix flake update` if it is older
+4. Check that the flags in the systemd units still exist: each binary's `--help` lists them
 
 ## License
 

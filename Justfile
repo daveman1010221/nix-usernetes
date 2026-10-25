@@ -21,7 +21,7 @@
 
 # ── configuration ─────────────────────────────────────────────────────────────
 
-IMAGE        := "localhost/nix-usernetes-node:1.33.10"
+IMAGE        := "localhost/nix-usernetes-node:1.37.1"
 CONTAINER    := "u7s"
 NODE_NAME    := "u7s-node"
 POD_SUBNET   := "10.244.0.0/16"
