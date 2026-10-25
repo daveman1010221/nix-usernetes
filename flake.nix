@@ -348,8 +348,8 @@
           Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetes}/bin:${pkgs.nftables}/bin
           ExecStart=${kubernetes}/bin/kube-proxy \
             --kubeconfig=/etc/kubernetes/admin.conf \
-            --proxy-mode=iptables \
-            --cluster-cidr=10.244.0.0/24 \
+            --proxy-mode=nftables \
+            --cluster-cidr=${podSubnet} \
             --conntrack-max-per-core=0
           Restart=always
           RestartSec=5
@@ -444,6 +444,40 @@
           WantedBy=multi-user.target
         '';
 
+        # ── pod networking, all in nftables ───────────────────────────────────
+        # Nothing here goes through iptables: iptables-nft needs the kernel's
+        # xt_* extensions (xt_comment, xt_nat, xt_statistic, ...), which a
+        # minimal host kernel may not build. kube-proxy runs in nftables mode
+        # and portmap uses its nftables backend, both with `ip`-family tables.
+        # Pods are masqueraded by u7s-masquerade.service rather than by ptp's
+        # ipMasq: its nftables backend needs the `inet` family, which a kernel
+        # without IPv6 does not have.
+        podSubnet = "10.244.0.0/24";
+
+        masqueradeRules = pkgs.writeText "u7s-masquerade.nft" ''
+          table ip u7s-masquerade {
+            chain postrouting {
+              type nat hook postrouting priority srcnat; policy accept;
+              ip saddr ${podSubnet} ip daddr != { ${podSubnet}, 224.0.0.0/4 } masquerade
+            }
+          }
+        '';
+
+        masqueradeUnit = pkgs.writeText "u7s-masquerade.service" ''
+          [Unit]
+          Description=Masquerade pod traffic leaving the pod network
+          Before=containerd.service kubelet.service
+          DefaultDependencies=no
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/sh -c '${pkgs.nftables}/bin/nft delete table ip u7s-masquerade 2>/dev/null; ${pkgs.nftables}/bin/nft -f ${masqueradeRules}'
+
+          [Install]
+          WantedBy=multi-user.target
+        '';
+
         cniConfig = pkgs.writeText "10-u7s.conflist" ''
           {
             "cniVersion": "1.0.0",
@@ -451,10 +485,10 @@
             "plugins": [
               {
                 "type": "ptp",
-                "ipMasq": true,
+                "ipMasq": false,
                 "ipam": {
                   "type": "host-local",
-                  "ranges": [[{ "subnet": "10.244.0.0/24" }]],
+                  "ranges": [[{ "subnet": "${podSubnet}" }]],
                   "routes": [{ "dst": "0.0.0.0/0" }]
                 }
               },
@@ -467,6 +501,7 @@
               },
               {
                 "type": "portmap",
+                "backend": "nftables",
                 "capabilities": { "portMappings": true }
               }
             ]
@@ -1018,6 +1053,7 @@ PRETTY_NAME="nix-usernetes"
             cp ${kubeletUnit}           etc/systemd/system/kubelet.service
             cp ${kubeProxyUnit}         etc/systemd/system/kube-proxy.service
             cp ${sysctlUnit}            etc/systemd/system/u7s-sysctl.service
+            cp ${masqueradeUnit}        etc/systemd/system/u7s-masquerade.service
             cp ${imagePreloadUnit}      etc/systemd/system/image-preload.service
             cp ${clusterBootstrapUnit}  etc/systemd/system/cluster-bootstrap.service
             cp ${clusterBootstrapPathUnit} etc/systemd/system/cluster-bootstrap.path
@@ -1038,6 +1074,8 @@ PRETTY_NAME="nix-usernetes"
               etc/systemd/system/multi-user.target.wants/kube-proxy.service
             ln -sf /etc/systemd/system/u7s-sysctl.service \
               etc/systemd/system/multi-user.target.wants/u7s-sysctl.service
+            ln -sf /etc/systemd/system/u7s-masquerade.service \
+              etc/systemd/system/multi-user.target.wants/u7s-masquerade.service
             ln -sf /etc/systemd/system/image-preload.service \
               etc/systemd/system/multi-user.target.wants/image-preload.service
             ln -sf /etc/systemd/system/cluster-bootstrap.path \
@@ -1107,8 +1145,11 @@ PRETTY_NAME="nix-usernetes"
               section "iptables NAT POSTROUTING"
               iptables -t nat -L POSTROUTING -n -v
 
-              section "iptables NAT KUBE-SERVICES"
-              iptables -t nat -L KUBE-SERVICES -n -v
+              section "nftables kube-proxy table"
+              nft list table ip kube-proxy
+
+              section "nftables pod masquerade table"
+              nft list table ip u7s-masquerade
 
               section "nftables ruleset (nat table)"
               nft list table ip nat
