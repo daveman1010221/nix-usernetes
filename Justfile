@@ -327,7 +327,7 @@ _prepull-images: _check-running
     #!/usr/bin/env bash
     set -euo pipefail
     for img in \
-        registry.k8s.io/pause:3.10.1; do
+        registry.k8s.io/pause:3.10.2; do
         if podman exec {{CONTAINER}} ctr -n k8s.io images check "$img" &>/dev/null; then
             echo "Image $img already in cluster, skipping."
             continue

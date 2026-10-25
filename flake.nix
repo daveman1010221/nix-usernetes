@@ -23,7 +23,7 @@
         k8sTag         = "v${k8sVersion}";
         k8sMinor       = builtins.elemAt (pkgs.lib.splitString "." k8sVersion) 1;
         k8sSha256      = "sha256-iSlaw3XrD9/migaW2BvmFXcdayfHrZu2ddxv/Q0s5fM=";
-        coreDNSVersion = "1.12.1";
+        coreDNSVersion = "1.14.6";
 
         # ── CoreDNS OCI image ─────────────────────────────────────────────────
         # Fetched by Nix at build time and bundled into the node image.
@@ -35,8 +35,8 @@
         # the correct hash from the error output, replace fakeHash with it.
         coreDNSImage = pkgs.dockerTools.pullImage {
           imageName      = "registry.k8s.io/coredns/coredns";
-          imageDigest    = "sha256:4f7a57135719628cf2070c5e3cbde64b013e90d4c560c5ecbf14004181f91998";
-          sha256         = "sha256-8Op3vzupnC6kWIgjqk4ck2tzY2sra+L3xdzoQ4TTUtI=";
+          imageDigest    = "sha256:900f9c109f7a33545d3c811516e8376df9019147b750f5ce3e254468769176ea";
+          sha256         = "sha256-FBp3wbQ9tkw9nf5w1tgs6ysx8UBBHaHxUHL7TJYK9L0=";
           finalImageName = "registry.k8s.io/coredns/coredns";
           finalImageTag  = "v${coreDNSVersion}";
         };
@@ -393,9 +393,8 @@
         '';
 
         containerdConfig = pkgs.writeText "containerd-config.toml" ''
-          version = 3
+          version = 4
           [plugins."io.containerd.cri.v1.runtime"]
-            sandbox_image = "registry.k8s.io/pause:3.10.1"
             restrict_oom_score_adj = true
             [plugins."io.containerd.cri.v1.runtime".cni]
               bin_dirs = ["/opt/cni/bin"]
@@ -407,6 +406,9 @@
                 [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
                   SystemdCgroup = false
                   NoPivotRoot = true
+          # The pause image, which _prepull-images in the Justfile loads.
+          [plugins."io.containerd.cri.v1.images".pinned_images]
+            sandbox = "registry.k8s.io/pause:3.10.2"
           [plugins."io.containerd.cri.v1.images".registry]
             config_path = "/etc/containerd/certs.d"
         '';
@@ -1266,7 +1268,7 @@ PRETTY_NAME="nix-usernetes"
             echo "  just kubeconfig                               — write kubeconfig"
             echo "  just install-cert-manager                     — Polar prereq"
             echo ""
-            echo "  nix build .#kubernetes    — build patched K8s binaries only"
+            echo "  nix build .#kubernetes    — build K8s binaries only"
             echo "  nix build .#debug-image   — build debug image"
           '';
         };
