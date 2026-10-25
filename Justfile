@@ -33,11 +33,21 @@ PORT_KUBELET   := "10250"
 
 # ── core lifecycle ────────────────────────────────────────────────────────────
 
-# Start the node container. Idempotent.
+# Start the node container. Idempotent: a running node is left alone, a stopped one (after the host rebooted) is started,
+# and a missing one is created on the existing state volumes. Everything the cluster keeps is on a volume, so a node
+# container that was removed (`just down`, or by hand) comes back as it was, persistent volumes included.
 # --dns-search=. keeps the host's search domain out of the node's resolv.conf. Kubelet copies that file into every pod,
 # and with ndots:5 a host domain (a corporate or wifi one) is tried before the real name; when the host's resolver does
 # not answer it, every lookup waits out CoreDNS's 5 s upstream timeout and clients with shorter budgets give up.
 up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    state=$(podman container inspect --format '{{{{.State.Status}}' {{CONTAINER}} 2>/dev/null || echo absent)
+    case "$state" in
+        running) echo "Container '{{CONTAINER}}' already running."; exit 0 ;;
+        absent)  ;;
+        *)       echo "Starting the stopped container '{{CONTAINER}}' ($state)."; exec podman start {{CONTAINER}} ;;
+    esac
     podman run -d \
         --name {{CONTAINER}} \
         --hostname {{NODE_NAME}} \
@@ -61,20 +71,24 @@ up:
         --volume u7s-etcd:/var/lib/etcd \
         --volume u7s-kubelet:/var/lib/kubelet \
         --volume u7s-containerd:/var/lib/containerd \
+        --volume u7s-local-path:/opt/local-path-provisioner \
         --env container=docker \
         --env NODE_NAME={{NODE_NAME}} \
         --stop-signal RTMIN+3 \
-        {{IMAGE}} \
-        2>/dev/null || echo "Container '{{CONTAINER}}' already running."
+        {{IMAGE}}
 
-# Stop the node container gracefully.
+# Stop the node container gracefully and remove it. The cluster's state stays on the volumes.
 down:
     podman stop --time 30 {{CONTAINER}} 2>/dev/null || true
     podman rm {{CONTAINER}} 2>/dev/null || true
 
-# Stop and wipe all state. Next `just up && just init` starts fresh.
+# Recreate the node container on the same state: how a newly loaded node image takes effect. For a newer Kubernetes
+# minor version than one up from the cluster's, use `reset` instead: the control plane and etcd go one minor at a time.
+restart: down up
+
+# Stop and wipe all state, persistent volumes included. Next `just up && just init` starts fresh.
 reset: down
-    podman volume rm -f u7s-pki u7s-etcd u7s-kubelet u7s-containerd 2>/dev/null || true
+    podman volume rm -f u7s-pki u7s-etcd u7s-kubelet u7s-containerd u7s-local-path 2>/dev/null || true
     rm -f kubeconfig
     @echo "State wiped. Run 'just up && just init' to start fresh."
 
@@ -101,7 +115,7 @@ status:
 # CoreDNS starts automatically via static pod — no manual DNS setup needed.
 # cert-manager is NOT installed here — it is a Polar concern.
 # Run `just install-cert-manager` separately before deploying Polar.
-init: _gen-pki _gen-configs _gen-apiserver-env _untaint _prepull-images
+init: _gen-pki _gen-configs _untaint _prepull-images
     @echo ""
     @echo "✓ Cluster initialised. Run 'just kubeconfig' then:"
     @echo "  export KUBECONFIG=$(pwd)/kubeconfig"
@@ -277,23 +291,6 @@ _gen-configs: _check-running
     write_kubeconfig /etc/kubernetes/kubelet.conf \
         "system:node:{{NODE_NAME}}" kubelet-client kubelet-client "https://{{NODE_NAME}}:{{PORT_APISERVER}}"
     echo "Kubeconfigs written."
-
-# Patch the apiserver unit with the actual CONTAINER_IP and restart services.
-_gen-apiserver-env: _check-running
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if podman exec {{CONTAINER}} grep -q "advertise-address=10\." /etc/systemd/system/kube-apiserver.service 2>/dev/null; then
-        echo "Apiserver already configured, skipping."
-        exit 0
-    fi
-    CONTAINER_IP=$(podman exec {{CONTAINER}} ip -4 addr show tap0 | grep "inet " | head -1 | sed 's|.*inet \([0-9.]*\)/.*|\1|')
-    echo "Configuring apiserver with CONTAINER_IP=${CONTAINER_IP}..."
-    podman exec {{CONTAINER}} sed -i \
-        "s/--advertise-address=\$HOST_IP/--advertise-address=${CONTAINER_IP}/g" \
-        /etc/systemd/system/kube-apiserver.service
-    podman exec {{CONTAINER}} systemctl daemon-reload
-    podman exec {{CONTAINER}} systemctl restart --no-block etcd kube-apiserver kube-controller-manager kube-scheduler kubelet 2>/dev/null || true
-    echo "Control plane services restarted."
 
 # Wait for apiserver and remove the control-plane taint so pods schedule on this node.
 _untaint: _check-running

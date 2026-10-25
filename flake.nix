@@ -226,16 +226,38 @@
           WantedBy=multi-user.target
         '';
 
+        # The apiserver advertises the address slirp4netns gives the node (10.0.2.100). It is read from tap0
+        # before every start and handed over in /run (a tmpfs), so nothing about it is kept in the container:
+        # a container that is removed and created again (`just restart`, or by hand) starts as it did.
+        apiserverAddress = pkgs.writeShellScript "kube-apiserver-address" ''
+          for _ in $(${coreutils}/bin/seq 1 30); do
+            set -- $(${iproute2}/bin/ip -4 -o addr show dev tap0 2>/dev/null)
+            if [ -n "''${4:-}" ]; then
+              echo "HOST_IP=''${4%/*}" > /run/kube-apiserver.env
+              exit 0
+            fi
+            ${coreutils}/bin/sleep 1
+          done
+          echo "kube-apiserver: tap0 has no IPv4 address" >&2
+          exit 1
+        '';
+
         apiserverUnit = pkgs.writeText "kube-apiserver.service" ''
           [Unit]
           Description=Kubernetes API Server
           After=etcd.service
-          Requires=etcd.service
+          # Wants, not Requires: etcd fails its first start when it begins while `just init` is still writing the PKI
+          # (it is restarted 5 s later), and with Requires that failure cancelled this unit's queued start for good.
+          # Each unit retries on its own (Restart=always) until what it needs answers.
+          Wants=etcd.service
 
           [Service]
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/pki/apiserver.crt; do sleep 2; done'
+          ExecStartPre=${apiserverAddress}
+          # Optional ("-"): systemd loads it for every process it spawns, the ExecStartPre that writes it included.
+          EnvironmentFile=-/run/kube-apiserver.env
           ExecStart=${kubernetes}/bin/kube-apiserver \
-            --advertise-address=$HOST_IP \
+            --advertise-address=''${HOST_IP} \
             --bind-address=0.0.0.0 \
             --allow-privileged=true \
             --authorization-mode=Node,RBAC \
@@ -264,7 +286,6 @@
             --tls-private-key-file=/etc/kubernetes/pki/apiserver.key
           Restart=always
           RestartSec=5
-          PassEnvironment=HOST_IP
 
           [Install]
           WantedBy=multi-user.target
@@ -274,7 +295,7 @@
           [Unit]
           Description=Kubernetes Controller Manager
           After=kube-apiserver.service
-          Requires=kube-apiserver.service
+          Wants=kube-apiserver.service
 
           [Service]
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/controller-manager.conf; do sleep 2; done'
@@ -302,7 +323,7 @@
           [Unit]
           Description=Kubernetes Scheduler
           After=kube-apiserver.service
-          Requires=kube-apiserver.service
+          Wants=kube-apiserver.service
 
           [Service]
           ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/scheduler.conf; do sleep 2; done'
@@ -1126,6 +1147,7 @@ PRETTY_NAME="nix-usernetes"
               "/var/lib/kubelet"      = {};
               "/var/lib/etcd"         = {};
               "/var/lib/containerd"   = {};
+              "/opt/local-path-provisioner" = {};
             };
             Labels = {
               "org.opencontainers.image.title"       = "nix-usernetes-node";

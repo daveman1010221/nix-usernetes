@@ -57,30 +57,38 @@ kubectl cluster-info
 
 ### Subsequent starts
 
-PKI and state persist in named podman volumes. No need to re-init:
+Everything the cluster keeps is on named podman volumes: `u7s-pki` (PKI and kubeconfigs), `u7s-etcd`, `u7s-kubelet`,
+`u7s-containerd` (images) and `u7s-local-path` (every persistent volume's data). The node container itself holds
+nothing, so it may be stopped, removed (by `just down`, or by hand, `podman system prune` included) and created again
+without losing anything. No need to re-init:
 
 ```bash
-just up
+just up          # starts a stopped node (after a host reboot), or creates a removed one on the volumes
 just kubeconfig
 export KUBECONFIG=$(pwd)/kubeconfig
 kubectl get nodes
 ```
 
-### Tear down
+### Restart, tear down
 
 ```bash
-just down        # stop container, preserve state volumes
-just reset       # stop container and wipe all state
+just restart     # recreate the node container on the same state: how a newly loaded node image takes effect
+just down        # stop and remove the node container; the state volumes stay
+just reset       # stop the node and wipe all state, persistent volumes included
 ```
+
+A node image with a Kubernetes minor version more than one ahead of the cluster's needs `reset`, not `restart`: the
+control plane and etcd are upgraded one minor version at a time.
 
 ## Just targets
 
 | Target | Description |
 |--------|-------------|
-| `just up` | Start the node container |
-| `just down` | Stop the node container gracefully |
-| `just reset` | Stop and wipe all state (PKI, etcd data, kubelet state) |
-| `just init` | Generate PKI, kubeconfigs, start control plane services |
+| `just up` | Start the node container: a stopped one is started, a missing one created on the state volumes |
+| `just down` | Stop the node container gracefully and remove it; the state volumes stay |
+| `just restart` | `down` then `up`: apply a newly loaded node image |
+| `just reset` | Stop and wipe all state (PKI, etcd, kubelet, images, persistent volumes) |
+| `just init` | Generate PKI and kubeconfigs on a fresh cluster, untaint it, prepull images |
 | `just kubeconfig` | Extract admin kubeconfig to `./kubeconfig` |
 | `just shell` | Open a shell inside the node container |
 | `just logs` | Follow container logs |
@@ -105,10 +113,11 @@ flake.nix
 **Bootstrap flow (`just init`):**
 1. Generate PKI with openssl inside the container
 2. Write kubeconfigs for all components
-3. Patch the kube-apiserver unit with the host IP address
-4. `systemctl restart` all control plane services
-5. Wait for apiserver readiness
-6. Remove control-plane taint so workloads schedule
+3. The control plane units, each waiting for its files, start on their own; kube-apiserver reads the node's
+   address from `tap0` before every start
+4. Wait for apiserver readiness
+5. Remove control-plane taint so workloads schedule
+6. Prepull the pause image
 
 ## Updating Kubernetes versions
 
