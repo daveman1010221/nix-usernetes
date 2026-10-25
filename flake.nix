@@ -424,6 +424,19 @@
             capabilities = ["pull", "resolve"]
         '';
 
+        # hosts.toml for a registry kept in the cluster (Polar's sandbox-local),
+        # which the node pulls from as localhost:30500, a NodePort. kube-proxy's
+        # nftables mode serves NodePorts on the node's addresses but not on
+        # 127.0.0.1 (iptables mode did, through route_localnet), so containerd
+        # sends those pulls to the same NodePort on the node's own address:
+        # 10.0.2.100, the address slirp4netns gives the container.
+        inClusterRegistryHostsToml = pkgs.writeText "hosts.toml" ''
+          server = "http://10.0.2.100:30500"
+
+          [host."http://10.0.2.100:30500"]
+            capabilities = ["pull", "resolve"]
+        '';
+
         sysctlConfig = pkgs.writeText "99-u7s.conf" ''
           net.ipv4.conf.default.arp_notify=1
           net.ipv4.conf.default.arp_accept=1
@@ -1000,6 +1013,8 @@ PRETTY_NAME="nix-usernetes"
             cp ${containerdConfig} etc/containerd/config.toml
             mkdir -p etc/containerd/certs.d/10.0.2.2:5000
             cp ${localRegistryHostsToml} etc/containerd/certs.d/10.0.2.2:5000/hosts.toml
+            mkdir -p etc/containerd/certs.d/localhost:30500
+            cp ${inClusterRegistryHostsToml} etc/containerd/certs.d/localhost:30500/hosts.toml
             mkdir -p etc/sysctl.d
             cp ${sysctlConfig} etc/sysctl.d/99-u7s.conf
 
