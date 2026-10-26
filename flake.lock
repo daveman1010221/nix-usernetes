@@ -66,11 +66,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1792973718,
-        "narHash": "sha256-E1Nm2FHUz4C9EEVEX8Q/Gc32RgFGg3HpK9w5XdThXRA=",
+        "lastModified": 1792977339,
+        "narHash": "sha256-hqkVilblpykHOBBMc45/yPG75CgSQBOIXp1IA6q+OD4=",
         "owner": "daveman1010221",
         "repo": "vigil-rs-nix",
-        "rev": "012b7e551f38f89407b4f424defaab43c8f81985",
+        "rev": "8e050cf903cc2cea9d05e1ccaa2341703545e3de",
         "type": "github"
       },
       "original": {
