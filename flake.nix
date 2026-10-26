@@ -8,9 +8,14 @@
     vigil-rs.url = "github:daveman1010221/vigil-rs-nix";
     vigil-rs.inputs.nixpkgs.follows = "nixpkgs";
     vigil-rs.inputs.flake-utils.follows = "flake-utils";
+    # The node is a nix-container-lib System container (node.dhall), with the vigil-rs above.
+    nix-container-lib.url = "github:daveman1010221/nix-container-lib";
+    nix-container-lib.inputs.nixpkgs.follows = "nixpkgs";
+    nix-container-lib.inputs.flake-utils.follows = "flake-utils";
+    nix-container-lib.inputs.vigil-rs.follows = "vigil-rs";
   };
 
-  outputs = { self, nixpkgs, flake-utils, vigil-rs }:
+  outputs = { self, nixpkgs, flake-utils, vigil-rs, nix-container-lib }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         pkgs = import nixpkgs {
@@ -62,7 +67,7 @@
           cri-tools
           etcd
           flannel
-          helm
+          kubernetes-helm
           openssl
           jq
           curl
@@ -72,7 +77,6 @@
           ;
 
         cniPlugins = pkgs.cni-plugins;
-        vigil = vigil-rs.packages.${system}.default;
 
         # ── Kubernetes source ─────────────────────────────────────────────────
         kubernetesSrc = pkgs.fetchurl {
@@ -178,22 +182,20 @@
           };
         };
 
-        # ── node services, supervised by vigild ───────────────────────────────
-        # vigild is PID 1 (nodeInit below) and runs each service from the layer in /etc/vigil/layers. It starts a service
-        # once those it is ordered `after` are running, not once they have done anything, so what a service needs before
-        # it can start (its certificates, its kubeconfig, the preloaded images) it waits for itself, in its own script.
-        # Every dependency is ordering only, as `Wants=` was: a service that fails is restarted on its own (with backoff)
-        # until what it needs answers, and nothing that depends on it is stopped meanwhile.
+        # ── node services' scripts ────────────────────────────────────────────
+        # Each service in node.dhall runs one of these, as /bin/u7s-<service>. vigild starts a service once those it is
+        # ordered `after` are running, not once they have done anything, so what a service needs before it can start
+        # (its certificates, its kubeconfig, the preloaded images) it waits for itself, here.
         servicePath = "/bin:/sbin:/usr/bin:/usr/sbin";
         waitFor = path: ''until [ -e ${path} ]; do sleep 2; done'';
 
-        containerdRun = pkgs.writeShellScript "containerd-run" ''
+        containerdRun = pkgs.writeShellScriptBin "u7s-containerd" ''
           export PATH=${servicePath}:${containerd}/bin:${runc}/bin:${cri-tools}/bin:${pkgs.rootlesskit}/bin:${pkgs.slirp4netns}/bin
           modprobe overlay 2>/dev/null || true
           exec ${containerd}/bin/containerd
         '';
 
-        etcdRun = pkgs.writeShellScript "etcd-run" ''
+        etcdRun = pkgs.writeShellScriptBin "u7s-etcd" ''
           export PATH=${servicePath}
           ${waitFor "/etc/kubernetes/pki/etcd/server.crt"}
           exec ${etcd}/bin/etcd \
@@ -217,7 +219,7 @@
         # The apiserver advertises the address slirp4netns gives the node (10.0.2.100), read from tap0 at every start,
         # so nothing about it is kept in the container: one that is removed and created again (`just restart`, or by
         # hand) starts as it did.
-        apiserverRun = pkgs.writeShellScript "kube-apiserver-run" ''
+        apiserverRun = pkgs.writeShellScriptBin "u7s-kube-apiserver" ''
           export PATH=${servicePath}
           ${waitFor "/etc/kubernetes/pki/apiserver.crt"}
           HOST_IP=
@@ -257,7 +259,7 @@
             --tls-private-key-file=/etc/kubernetes/pki/apiserver.key
         '';
 
-        controllerManagerRun = pkgs.writeShellScript "kube-controller-manager-run" ''
+        controllerManagerRun = pkgs.writeShellScriptBin "u7s-kube-controller-manager" ''
           export PATH=${servicePath}
           ${waitFor "/etc/kubernetes/controller-manager.conf"}
           exec ${kubernetes}/bin/kube-controller-manager \
@@ -275,7 +277,7 @@
             --use-service-account-credentials=true
         '';
 
-        schedulerRun = pkgs.writeShellScript "kube-scheduler-run" ''
+        schedulerRun = pkgs.writeShellScriptBin "u7s-kube-scheduler" ''
           export PATH=${servicePath}
           ${waitFor "/etc/kubernetes/scheduler.conf"}
           exec ${kubernetes}/bin/kube-scheduler \
@@ -285,7 +287,7 @@
 
         # The kubelet waits for image-preload to have imported CoreDNS into containerd, before it reads the static pod
         # manifest directory.
-        kubeletRun = pkgs.writeShellScript "kubelet-run" ''
+        kubeletRun = pkgs.writeShellScriptBin "u7s-kubelet" ''
           export PATH=${servicePath}:${kubernetes}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin
           ${waitFor "/etc/kubernetes/kubelet.conf"}
           ${waitFor "/run/u7s/images-preloaded"}
@@ -295,7 +297,7 @@
             --v=2
         '';
 
-        kubeProxyRun = pkgs.writeShellScript "kube-proxy-run" ''
+        kubeProxyRun = pkgs.writeShellScriptBin "u7s-kube-proxy" ''
           export PATH=${servicePath}:${kubernetes}/bin:${pkgs.nftables}/bin
           ${waitFor "/etc/kubernetes/admin.conf"}
           exec ${kubernetes}/bin/kube-proxy \
@@ -595,10 +597,10 @@
         # A one-shot service: once containerd answers, it imports every OCI tarball in /var/lib/preload-images/ into
         # containerd's k8s.io namespace, so static pod images are there without any network access at cluster init,
         # and leaves /run/u7s/images-preloaded for the kubelet, which waits for it.
-        imagePreloadRun = pkgs.writeShellScript "image-preload-run" ''
+        imagePreloadRun = pkgs.writeShellScriptBin "u7s-image-preload" ''
           export PATH=${servicePath}:${containerd}/bin
           until ctr version >/dev/null 2>&1; do sleep 1; done
-          sh /usr/local/bin/preload-images.sh
+          sh ${imagePreloadScript}
           touch /run/u7s/images-preloaded
         '';
 
@@ -624,7 +626,7 @@
         # ── cluster bootstrap ─────────────────────────────────────────────────
         # A one-shot service: it waits for /etc/kubernetes/admin.conf (written by just init's _gen-configs step) and a
         # live apiserver, then applies the kube-dns Service. It runs at every start; kubectl apply is idempotent.
-        clusterBootstrapRun = pkgs.writeShellScript "cluster-bootstrap-run" ''
+        clusterBootstrapRun = pkgs.writeShellScriptBin "u7s-cluster-bootstrap" ''
           export PATH=${servicePath}:${kubernetes}/bin
           ${waitFor "/etc/kubernetes/admin.conf"}
           until kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes >/dev/null 2>&1; do
@@ -635,173 +637,58 @@
             apply -f /var/lib/cluster-bootstrap/kube-dns-service.yaml
         '';
 
-        # ── the vigil layer: what vigild runs ─────────────────────────────────
-        # Each service's output is kept in vigild's memory (logs-forward: disabled), not printed to the container's
-        # stdout: podman sends that to the host's journal, and the kubelet at --v=2 would fill it. Read it with
-        # `just logs <service>` (vigil logs); nothing is written to disk, and it is gone with the container.
-        # One-shot services (image-preload, cluster-bootstrap) end Inactive when they succeed and are retried when they
-        # fail. vigild stops every service at once on SIGTERM (podman stop): the container goes down as a whole.
-        vigilLayer = pkgs.writeText "001-node.yaml" ''
-          summary: nix-usernetes node
-
-          services:
-            containerd:
-              summary: containerd container runtime
-              command: ${containerdRun}
-              startup: enabled
-              kill-delay: 10s
-              logs-forward: disabled
-
-            image-preload:
-              summary: import the bundled images into containerd
-              command: ${imagePreloadRun}
-              startup: enabled
-              after: [containerd]
-              on-success: ignore
-              on-failure: restart
-              logs-forward: disabled
-
-            etcd:
-              summary: etcd key-value store
-              command: ${etcdRun}
-              startup: enabled
-              kill-delay: 10s
-              logs-forward: disabled
-
-            kube-apiserver:
-              summary: Kubernetes API server
-              command: ${apiserverRun}
-              startup: enabled
-              after: [etcd]
-              kill-delay: 10s
-              logs-forward: disabled
-
-            kube-controller-manager:
-              summary: Kubernetes controller manager
-              command: ${controllerManagerRun}
-              startup: enabled
-              after: [kube-apiserver]
-              logs-forward: disabled
-
-            kube-scheduler:
-              summary: Kubernetes scheduler
-              command: ${schedulerRun}
-              startup: enabled
-              after: [kube-apiserver]
-              logs-forward: disabled
-
-            kubelet:
-              summary: kubelet
-              command: ${kubeletRun}
-              startup: enabled
-              after: [containerd, image-preload]
-              kill-delay: 20s
-              logs-forward: disabled
-
-            kube-proxy:
-              summary: kube-proxy
-              command: ${kubeProxyRun}
-              startup: enabled
-              after: [kube-apiserver]
-              logs-forward: disabled
-
-            cluster-bootstrap:
-              summary: apply the kube-dns Service
-              command: ${clusterBootstrapRun}
-              startup: enabled
-              after: [kube-apiserver]
-              on-success: ignore
-              on-failure: restart
-              logs-forward: disabled
-        '';
-
-        # ── PID 1 ─────────────────────────────────────────────────────────────
-        # What the node does once, at each start, before vigild takes over as PID 1:
-        #
-        # cgroups: the container has its own cgroup v2 namespace (--cgroupns=private), and the kubelet and containerd
-        #   (cgroupfs driver) create a cgroup for every pod under its root, /k8s.io/<id>. cgroup v2 lets a cgroup hand
-        #   controllers to its children only while no process is in it, so everything already running moves to
-        #   /init.scope, where vigild and its services then stay, and every controller is enabled for the children.
-        #   systemd did the same. /init.scope is also where podman exec puts its processes.
-        # sysctls and the pod masquerade: kernel settings and an nftables table in the node's own network namespace.
-        # /etc/hosts: podman writes it at every start; the node's name resolves to itself (the kubeconfigs use it).
-        nodeInit = pkgs.writeShellScript "u7s-init" ''
+        # ── boot step: prepare ────────────────────────────────────────────────
+        # node.dhall's boot steps run once, at each start, before vigild: the cgroup delegation, the sysctls and the pod
+        # masquerade come from nix-container-lib; this does the rest. podman writes /etc/hosts at every start, and the
+        # node's name resolves to itself (the kubeconfigs use it). /run (a tmpfs) holds what the services hand each other.
+        nodePrepare = pkgs.writeShellScriptBin "u7s-prepare" ''
           export PATH=${servicePath}
-
-          cg=/sys/fs/cgroup
-          mkdir -p $cg/init.scope
-          for _ in 1 2 3; do
-            while read -r pid; do echo "$pid" > $cg/init.scope/cgroup.procs 2>/dev/null || true; done < $cg/cgroup.procs
-            [ -s $cg/cgroup.procs ] || break
-          done
-          controllers=$(sed -e 's/^/+/' -e 's/ / +/g' $cg/cgroup.controllers)
-          if ! echo "$controllers" > $cg/cgroup.subtree_control; then
-            echo "u7s-init: cannot delegate the cgroup controllers ($controllers); pods cannot start" >&2
-            exit 1
-          fi
-
-          sysctl -q -p /etc/sysctl.d/99-u7s.conf || echo "u7s-init: some sysctls were not applied" >&2
-          nft delete table ip u7s-masquerade 2>/dev/null
-          nft -f ${masqueradeRules} || echo "u7s-init: the pod masquerade was not loaded" >&2
           grep -q u7s-node /etc/hosts || echo "127.0.0.1 u7s-node" >> /etc/hosts
-
-          mkdir -p /run/u7s /run/vigil
-          exec ${vigil}/bin/vigild --layers-dir /etc/vigil/layers --socket /run/vigil/vigild.sock --log-buffer 5000
+          mkdir -p /run/u7s
         '';
 
-        nodeEtc = pkgs.runCommand "u7s-node-etc" {} ''
-          mkdir -p $out/etc/vigil/layers
-          cp ${vigilLayer} $out/etc/vigil/layers/001-node.yaml
-          printf 'ID=nix-usernetes\nNAME=nix-usernetes\nPRETTY_NAME="nix-usernetes"\n' > $out/etc/os-release
-        '';
+        nodeScripts = pkgs.symlinkJoin {
+          name  = "u7s-node-scripts";
+          paths = [
+            nodePrepare
+            containerdRun
+            imagePreloadRun
+            etcdRun
+            apiserverRun
+            controllerManagerRun
+            schedulerRun
+            kubeletRun
+            kubeProxyRun
+            clusterBootstrapRun
+          ];
+        };
 
-        # ── OCI layer image ───────────────────────────────────────────────────
-        nodeImage = pkgs.dockerTools.buildLayeredImage {
-          name = "nix-usernetes-node";
-          tag  = k8sVersion;
-          maxLayers = 20;
+        # ── OCI image ─────────────────────────────────────────────────────────
+        # A nix-container-lib System container, from node.dhall (rendered to node.nix). The library makes start.nu, which
+        # runs the boot steps, writes vigild's layer from the services, and execs vigild as PID 1; this adds what the
+        # node is made of.
+        node = nix-container-lib.lib.${system}.mkContainer {
+          inherit system pkgs;
+          inputs        = { inherit vigil-rs; };
+          configNixPath = ./node.nix;
+          tag           = k8sVersion;
 
-          contents = pkgs.lib.flatten [
-            bash
-            cniPlugins
-            conntrack-tools
-            containerd
-            coreutils
-            cri-tools
-            curl
-            ethtool
-            findutils
-            gnugrep
-            iproute2
-            iptables
-            jq
-            kmod
-            openssl
-            pkgs.cacert
-            pkgs.dockerTools.fakeNss
-            pkgs.dockerTools.usrBinEnv
-            pkgs.gnused
-            pkgs.nftables
-            procps
-            runc
-            socat
-            util-linux
-
-            # The control plane runs on the node, as services of vigild (PID 1)
+          extraDerivations = [
             kubernetes
-            etcd
-            helm
-
-            vigil
-            nodeEtc
+            nodeScripts
+            # `vigil services list`, `vigil logs` (just status, just logs)
+            vigil-rs.packages.${system}.vigil
+            # GNU coreutils over the library's (a subset: no seq, cut, wc, head, du, ...), which the scripts and
+            # `just init` use. start.nu keeps the library's: it puts them first on its own PATH.
+            (pkgs.lib.hiPrio coreutils)
           ];
 
-          fakeRootCommands = ''
-            mkdir -p var/lib/preload-images
-            cp ${coreDNSImage} var/lib/preload-images/coredns.tar
-          '';
-
+          # Files the node carries as files: a volume mounted over one of these directories (u7s-pki over
+          # /etc/kubernetes) is filled from the image when it is created, and keeps what it was filled with.
           extraCommands = ''
+            # tools that look in /sbin find them in /bin (every package here has its sbin tools in bin too)
+            [ -e sbin ] || ln -s bin sbin
+
             # containerd config
             mkdir -p etc/containerd
             cp ${containerdConfig} etc/containerd/config.toml
@@ -809,13 +696,11 @@
             cp ${localRegistryHostsToml} etc/containerd/certs.d/10.0.2.2:5000/hosts.toml
             mkdir -p etc/containerd/certs.d/localhost:30500
             cp ${inClusterRegistryHostsToml} etc/containerd/certs.d/localhost:30500/hosts.toml
-            mkdir -p etc/sysctl.d
-            cp ${sysctlConfig} etc/sysctl.d/99-u7s.conf
 
-            # CA certificates
-            mkdir -p etc/ssl/certs
-            ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt etc/ssl/certs/ca-certificates.crt
-            ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt etc/ssl/certs/ca-bundle.crt
+            # boot steps' files (node.dhall)
+            mkdir -p etc/sysctl.d etc/u7s
+            cp ${sysctlConfig} etc/sysctl.d/99-u7s.conf
+            cp ${masqueradeRules} etc/u7s/masquerade.nft
 
             # CNI binaries
             mkdir -p opt/cni/bin
@@ -843,40 +728,28 @@
             # Static pod manifest — kubelet manages CoreDNS automatically
             cp ${coreDNSManifest} etc/kubernetes/manifests/coredns.yaml
 
+            # The CoreDNS image, imported by the image-preload service
+            mkdir -p var/lib/preload-images
+            cp ${coreDNSImage} var/lib/preload-images/coredns.tar
+
             # ── Cluster bootstrap resources ────────────────────────────────────
             # Applied by the cluster-bootstrap service after apiserver is ready.
             mkdir -p var/lib/cluster-bootstrap
             cp ${kubeDNSServiceManifest} var/lib/cluster-bootstrap/kube-dns-service.yaml
 
-            # ── Image preload script ───────────────────────────────────────────
-            mkdir -p usr/local/bin
-            cp ${imagePreloadScript} usr/local/bin/preload-images.sh
-            chmod +x usr/local/bin/preload-images.sh
-
             # Standard dirs
             mkdir -p var/lib/kubelet var/lib/etcd
             mkdir -p run/containerd run/kubernetes
             mkdir -p lib/modules
-            mkdir -p tmp
 
             touch etc/resolv.conf
             echo "u7s-node" > etc/hostname
           '';
 
-          config = {
-            Cmd        = [ "${nodeInit}" ];
-            Entrypoint = [];
-            # vigild stops every service on SIGTERM, then exits.
-            StopSignal = "SIGTERM";
-            Env = [
-              "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
-              "SSL_CERT_DIR=/etc/ssl/certs"
-              "PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetes}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin"
-              "KUBECONFIG=/etc/kubernetes/admin.conf"
-            ];
-            # The node's state. Not /sys/fs/cgroup, /lib/modules or /run, which `just up` mounts (the cgroup filesystem, the
-            # host's modules, a tmpfs): as image volumes each was also an anonymous volume, a new one at every `podman run`
-            # and left behind by `podman rm`.
+          extraConfig = {
+            # The node's state. Not /sys/fs/cgroup, /lib/modules or /run, which `just up` mounts (the cgroup filesystem,
+            # the host's modules, a tmpfs): as image volumes each was also an anonymous volume, a new one at every
+            # `podman run` and left behind by `podman rm`.
             Volumes = {
               "/etc/kubernetes"       = {};
               "/var/lib/kubelet"      = {};
@@ -885,12 +758,13 @@
               "/opt/local-path-provisioner" = {};
             };
             Labels = {
-              "org.opencontainers.image.title"       = "nix-usernetes-node";
               "org.opencontainers.image.description" = "Single-node rootless Kubernetes for developer workstations";
               "org.opencontainers.image.version"     = k8sVersion;
             };
           };
         };
+
+        nodeImage = node.image;
 
         debugScript = pkgs.writeTextFile {
           name = "u7s-debug";
@@ -1023,13 +897,14 @@
             pkgs.gnumake
             containerd
             cri-tools
-            helm
+            kubernetes-helm
             pkgs.kubectl
             pkgs.just
             openssl
             jq
             curl
             pkgs.skopeo
+            pkgs.dhall-nix
           ];
           shellHook = ''
             echo "nix-usernetes dev shell"

@@ -22,7 +22,7 @@ A layered OCI container image containing:
 - **kubelet, kube-apiserver, kube-controller-manager, kube-scheduler, kubectl, kube-proxy** — built from source at K8s 1.37.1, as static binaries (`CGO_ENABLED=0`)
 - **etcd** — from nixpkgs
 - **containerd, runc, cri-tools, cni-plugins** — from nixpkgs
-- **vigild as PID 1** — [vigil-rs](https://github.com/git001/vigil-rs), a service supervisor; `u7s-init` hands the cgroup controllers to the pods' cgroups, then runs it
+- **vigild as PID 1** — [vigil-rs](https://github.com/git001/vigil-rs), through nix-container-lib's `System` mode: its start script runs the node's boot steps (the cgroup controllers handed to the pods' cgroups, the sysctls, the pod masquerade), then execs vigild
 
 All control plane components (etcd, kube-apiserver, kube-controller-manager, kube-scheduler), containerd and the kubelet run as **vigild services** using the Nix-built binaries already in the image. No container image pulls, no pause images, no in-cluster CNI required for the control plane.
 
@@ -93,22 +93,28 @@ control plane and etcd are upgraded one minor version at a time.
 | `just shell` | Open a shell inside the node container |
 | `just logs [service...]` | Follow the services' logs (kept in memory by vigild, the last 5000 lines of each) |
 | `just status` | Show the services' state (`vigil services list`) and the node's pods |
+| `just render` | Render `node.dhall` to `node.nix` after changing what the node runs |
 
 ## Architecture
 
+The node is a [nix-container-lib](https://github.com/daveman1010221/nix-container-lib) `System` container: vigild is PID 1 and runs the node's services, with no session (no user, no shell in front, no SSH).
+
 ```
-flake.nix
+node.dhall  →  just render  →  node.nix          what the node runs
+├── packages      (a custom layer: containerd, etcd, iproute2, nftables, ...)
+├── boot steps    (once at each start: delegate the cgroups, sysctls, the pod masquerade, u7s-prepare)
+└── services      (vigild's: containerd, etcd, kube-apiserver, ..., each running /bin/u7s-<service>)
+
+flake.nix                                         what those are made of
 ├── kubernetes  (stdenv.mkDerivation)
 │   ├── src: kubernetes-v1.37.1.tar.gz
 │   └── buildPhase: go build -mod=vendor CGO_ENABLED=0
-│
-└── nodeImage  (dockerTools.buildLayeredImage)
-    ├── u7s-init, then vigild as PID 1
-    ├── containerd + runc + cri-tools
-    ├── etcd (nixpkgs)
-    ├── kubernetes binaries
-    └── a vigil layer (/etc/vigil/layers) with a service for each component
+├── the services' scripts (/bin/u7s-*), each waiting for what it needs before it starts
+└── nodeImage  (nix-container-lib mkContainer, from node.nix)
+    └── the files the node carries: containerd's, the kubelet's and CNI's configuration, CoreDNS
 ```
+
+After changing `node.dhall`, run `just render` and commit `node.nix` with it.
 
 **Bootstrap flow (`just init`):**
 1. Generate PKI with openssl inside the container

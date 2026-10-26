@@ -418,3 +418,8 @@ debug-pod pod: _check-running
 # Run this after every `nix build .#node-image -o result-node-image`.
 load-node-image:
     podman load -i result-node-image
+
+# Render node.dhall (what the node runs: its packages, boot steps and services) to node.nix, which nix build reads.
+# Commit both. Needs dhall-to-nix (nix shell nixpkgs#dhall-nix) and the network, for the library's prelude.
+render:
+    dhall-to-nix < node.dhall > node.nix

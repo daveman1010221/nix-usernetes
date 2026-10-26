@@ -18,6 +18,33 @@
         "type": "github"
       }
     },
+    "nix-container-lib": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "uutils-micro": "uutils-micro",
+        "vigil-rs": [
+          "vigil-rs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792979351,
+        "narHash": "sha256-AFJ4oGQ6fYp3a/ENe5UEsLBqfM26Xp76r2HSw5PIcOk=",
+        "owner": "daveman1010221",
+        "repo": "nix-container-lib",
+        "rev": "6c86c19101123245354a39bbf571b6f100770dc1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "daveman1010221",
+        "repo": "nix-container-lib",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1792773339,
@@ -37,6 +64,7 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
+        "nix-container-lib": "nix-container-lib",
         "nixpkgs": "nixpkgs",
         "vigil-rs": "vigil-rs"
       }
@@ -53,6 +81,31 @@
       "original": {
         "owner": "nix-systems",
         "repo": "default",
+        "type": "github"
+      }
+    },
+    "uutils-micro": {
+      "inputs": {
+        "flake-utils": [
+          "nix-container-lib",
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nix-container-lib",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792513890,
+        "narHash": "sha256-56FU4qF+N4YRTb7ttCfowLcJBpqJoA5dn1IUdiS1+ho=",
+        "owner": "daveman1010221",
+        "repo": "uutils-micro",
+        "rev": "fd2c97e53c9962300118b0534cae101e1b409213",
+        "type": "github"
+      },
+      "original": {
+        "owner": "daveman1010221",
+        "repo": "uutils-micro",
         "type": "github"
       }
     },
