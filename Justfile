@@ -57,7 +57,6 @@ up:
         --pids-limit -1 \
         --cgroupns=private \
         --ipc=host \
-        --systemd=always \
         --security-opt seccomp=unconfined \
         --security-opt apparmor=unconfined \
         --tmpfs /run \
@@ -72,9 +71,7 @@ up:
         --volume u7s-kubelet:/var/lib/kubelet \
         --volume u7s-containerd:/var/lib/containerd \
         --volume u7s-local-path:/opt/local-path-provisioner \
-        --env container=docker \
         --env NODE_NAME={{NODE_NAME}} \
-        --stop-signal RTMIN+3 \
         {{IMAGE}}
 
 # Stop the node container gracefully and remove it. The cluster's state stays on the volumes.
@@ -92,9 +89,10 @@ reset: down
     rm -f kubeconfig
     @echo "State wiped. Run 'just up && just init' to start fresh."
 
-# Show container logs (live).
-logs:
-    podman logs -f {{CONTAINER}}
+# Follow a service's log (`just logs kubelet`), or every service's with none given. vigild keeps the last 5000 lines of
+# each in memory; `podman logs` has only vigild's own messages (services starting, exiting, being restarted).
+logs *services:
+    podman exec -it {{CONTAINER}} vigil logs -f {{services}}
 
 # Open a shell inside the node.
 shell:
@@ -102,8 +100,8 @@ shell:
 
 # Show status of Kubernetes components inside the node.
 status:
-    @echo "=== systemd units ==="
-    podman exec {{CONTAINER}} systemctl status containerd kubelet image-preload cluster-bootstrap --no-pager || true
+    @echo "=== services ==="
+    podman exec {{CONTAINER}} vigil services list || true
     @echo ""
     @echo "=== static pods ==="
     podman exec {{CONTAINER}} \
@@ -305,7 +303,7 @@ _untaint: _check-running
             break
         fi
         if [ "$i" -eq 60 ]; then
-            echo "Timed out waiting for apiserver. Check: podman exec u7s systemctl status kubelet"
+            echo "Timed out waiting for apiserver. Check: just status, then just logs kube-apiserver (or kubelet)"
             exit 1
         fi
         sleep 3

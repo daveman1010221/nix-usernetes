@@ -4,9 +4,13 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    # vigild is the node's PID 1 and supervises its services; vigil is its CLI (`vigil services list`, `vigil logs`).
+    vigil-rs.url = "github:daveman1010221/vigil-rs-nix";
+    vigil-rs.inputs.nixpkgs.follows = "nixpkgs";
+    vigil-rs.inputs.flake-utils.follows = "flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, vigil-rs }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         pkgs = import nixpkgs {
@@ -27,7 +31,7 @@
 
         # ── CoreDNS OCI image ─────────────────────────────────────────────────
         # Fetched by Nix at build time and bundled into the node image.
-        # The image-preload systemd service imports it into containerd before
+        # The image-preload service imports it into containerd before
         # kubelet starts, so CoreDNS is available without any network access
         # at cluster init time.
         #
@@ -53,7 +57,6 @@
           iptables
           kmod
           procps
-          systemd
           containerd
           runc
           cri-tools
@@ -69,6 +72,7 @@
           ;
 
         cniPlugins = pkgs.cni-plugins;
+        vigil = vigil-rs.packages.${system}.default;
 
         # ── Kubernetes source ─────────────────────────────────────────────────
         kubernetesSrc = pkgs.fetchurl {
@@ -174,36 +178,25 @@
           };
         };
 
-        # ── systemd units and configs baked into the image ────────────────────
+        # ── node services, supervised by vigild ───────────────────────────────
+        # vigild is PID 1 (nodeInit below) and runs each service from the layer in /etc/vigil/layers. It starts a service
+        # once those it is ordered `after` are running, not once they have done anything, so what a service needs before
+        # it can start (its certificates, its kubeconfig, the preloaded images) it waits for itself, in its own script.
+        # Every dependency is ordering only, as `Wants=` was: a service that fails is restarted on its own (with backoff)
+        # until what it needs answers, and nothing that depends on it is stopped meanwhile.
+        servicePath = "/bin:/sbin:/usr/bin:/usr/sbin";
+        waitFor = path: ''until [ -e ${path} ]; do sleep 2; done'';
 
-        containerdUnit = pkgs.writeText "containerd.service" ''
-          [Unit]
-          Description=containerd container runtime
-          After=network.target
-          [Service]
-          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${containerd}/bin:${runc}/bin:${cri-tools}/bin:${pkgs.rootlesskit}/bin:${pkgs.slirp4netns}/bin
-          ExecStartPre=-/sbin/modprobe overlay
-          ExecStart=${containerd}/bin/containerd
-          Restart=always
-          RestartSec=5
-          Delegate=yes
-          KillMode=process
-          OOMScoreAdjust=-999
-          LimitNOFILE=1048576
-          LimitNPROC=infinity
-          LimitCORE=infinity
-          [Install]
-          WantedBy=multi-user.target
+        containerdRun = pkgs.writeShellScript "containerd-run" ''
+          export PATH=${servicePath}:${containerd}/bin:${runc}/bin:${cri-tools}/bin:${pkgs.rootlesskit}/bin:${pkgs.slirp4netns}/bin
+          modprobe overlay 2>/dev/null || true
+          exec ${containerd}/bin/containerd
         '';
 
-        etcdUnit = pkgs.writeText "etcd.service" ''
-          [Unit]
-          Description=etcd key-value store
-          After=network.target
-
-          [Service]
-          ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/pki/etcd/server.crt; do sleep 2; done'
-          ExecStart=${etcd}/bin/etcd \
+        etcdRun = pkgs.writeShellScript "etcd-run" ''
+          export PATH=${servicePath}
+          ${waitFor "/etc/kubernetes/pki/etcd/server.crt"}
+          exec ${etcd}/bin/etcd \
             --data-dir=/var/lib/etcd \
             --listen-client-urls=https://127.0.0.1:2379 \
             --advertise-client-urls=https://127.0.0.1:2379 \
@@ -219,45 +212,23 @@
             --peer-client-cert-auth=true \
             --peer-trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt \
             --snapshot-count=10000
-          Restart=always
-          RestartSec=5
-
-          [Install]
-          WantedBy=multi-user.target
         '';
 
-        # The apiserver advertises the address slirp4netns gives the node (10.0.2.100). It is read from tap0
-        # before every start and handed over in /run (a tmpfs), so nothing about it is kept in the container:
-        # a container that is removed and created again (`just restart`, or by hand) starts as it did.
-        apiserverAddress = pkgs.writeShellScript "kube-apiserver-address" ''
-          for _ in $(${coreutils}/bin/seq 1 30); do
-            set -- $(${iproute2}/bin/ip -4 -o addr show dev tap0 2>/dev/null)
-            if [ -n "''${4:-}" ]; then
-              echo "HOST_IP=''${4%/*}" > /run/kube-apiserver.env
-              exit 0
-            fi
-            ${coreutils}/bin/sleep 1
+        # The apiserver advertises the address slirp4netns gives the node (10.0.2.100), read from tap0 at every start,
+        # so nothing about it is kept in the container: one that is removed and created again (`just restart`, or by
+        # hand) starts as it did.
+        apiserverRun = pkgs.writeShellScript "kube-apiserver-run" ''
+          export PATH=${servicePath}
+          ${waitFor "/etc/kubernetes/pki/apiserver.crt"}
+          HOST_IP=
+          for _ in $(seq 1 30); do
+            set -- $(ip -4 -o addr show dev tap0 2>/dev/null)
+            if [ -n "''${4:-}" ]; then HOST_IP=''${4%/*}; break; fi
+            sleep 1
           done
-          echo "kube-apiserver: tap0 has no IPv4 address" >&2
-          exit 1
-        '';
-
-        apiserverUnit = pkgs.writeText "kube-apiserver.service" ''
-          [Unit]
-          Description=Kubernetes API Server
-          After=etcd.service
-          # Wants, not Requires: etcd fails its first start when it begins while `just init` is still writing the PKI
-          # (it is restarted 5 s later), and with Requires that failure cancelled this unit's queued start for good.
-          # Each unit retries on its own (Restart=always) until what it needs answers.
-          Wants=etcd.service
-
-          [Service]
-          ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/pki/apiserver.crt; do sleep 2; done'
-          ExecStartPre=${apiserverAddress}
-          # Optional ("-"): systemd loads it for every process it spawns, the ExecStartPre that writes it included.
-          EnvironmentFile=-/run/kube-apiserver.env
-          ExecStart=${kubernetes}/bin/kube-apiserver \
-            --advertise-address=''${HOST_IP} \
+          if [ -z "$HOST_IP" ]; then echo "kube-apiserver: tap0 has no IPv4 address" >&2; exit 1; fi
+          exec ${kubernetes}/bin/kube-apiserver \
+            --advertise-address="$HOST_IP" \
             --bind-address=0.0.0.0 \
             --allow-privileged=true \
             --authorization-mode=Node,RBAC \
@@ -284,22 +255,12 @@
             --service-cluster-ip-range=10.96.0.0/16 \
             --tls-cert-file=/etc/kubernetes/pki/apiserver.crt \
             --tls-private-key-file=/etc/kubernetes/pki/apiserver.key
-          Restart=always
-          RestartSec=5
-
-          [Install]
-          WantedBy=multi-user.target
         '';
 
-        controllerManagerUnit = pkgs.writeText "kube-controller-manager.service" ''
-          [Unit]
-          Description=Kubernetes Controller Manager
-          After=kube-apiserver.service
-          Wants=kube-apiserver.service
-
-          [Service]
-          ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/controller-manager.conf; do sleep 2; done'
-          ExecStart=${kubernetes}/bin/kube-controller-manager \
+        controllerManagerRun = pkgs.writeShellScript "kube-controller-manager-run" ''
+          export PATH=${servicePath}
+          ${waitFor "/etc/kubernetes/controller-manager.conf"}
+          exec ${kubernetes}/bin/kube-controller-manager \
             --allocate-node-cidrs=true \
             --cluster-cidr=10.244.0.0/16 \
             --cluster-name=kubernetes \
@@ -312,77 +273,43 @@
             --service-account-private-key-file=/etc/kubernetes/pki/sa.key \
             --service-cluster-ip-range=10.96.0.0/16 \
             --use-service-account-credentials=true
-          Restart=always
-          RestartSec=5
-
-          [Install]
-          WantedBy=multi-user.target
         '';
 
-        schedulerUnit = pkgs.writeText "kube-scheduler.service" ''
-          [Unit]
-          Description=Kubernetes Scheduler
-          After=kube-apiserver.service
-          Wants=kube-apiserver.service
-
-          [Service]
-          ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/scheduler.conf; do sleep 2; done'
-          ExecStart=${kubernetes}/bin/kube-scheduler \
+        schedulerRun = pkgs.writeShellScript "kube-scheduler-run" ''
+          export PATH=${servicePath}
+          ${waitFor "/etc/kubernetes/scheduler.conf"}
+          exec ${kubernetes}/bin/kube-scheduler \
             --kubeconfig=/etc/kubernetes/scheduler.conf \
             --leader-elect=false
-          Restart=always
-          RestartSec=5
-
-          [Install]
-          WantedBy=multi-user.target
         '';
 
-        # kubelet depends on image-preload so CoreDNS is in containerd
-        # before kubelet reads the static pod manifest directory.
-        kubeletUnit = pkgs.writeText "kubelet.service" ''
-          [Unit]
-          Description=kubelet
-          After=containerd.service image-preload.service
-          Requires=containerd.service
-
-          [Service]
-          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetes}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin
-          ExecStartPre=/bin/sh -c 'grep -q u7s-node /etc/hosts || echo "127.0.0.1 u7s-node" >> /etc/hosts'
-          ExecStartPre=/bin/sh -c 'until test -f /etc/kubernetes/kubelet.conf; do sleep 2; done'
-          ExecStart=${kubernetes}/bin/kubelet \
+        # The kubelet waits for image-preload to have imported CoreDNS into containerd, before it reads the static pod
+        # manifest directory.
+        kubeletRun = pkgs.writeShellScript "kubelet-run" ''
+          export PATH=${servicePath}:${kubernetes}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin
+          ${waitFor "/etc/kubernetes/kubelet.conf"}
+          ${waitFor "/run/u7s/images-preloaded"}
+          exec ${kubernetes}/bin/kubelet \
             --config=/etc/kubelet/kubelet-config.yaml \
             --kubeconfig=/etc/kubernetes/kubelet.conf \
             --v=2
-          Restart=always
-          RestartSec=10
-          TimeoutStopSec=60
-
-          [Install]
-          WantedBy=multi-user.target
         '';
 
-        kubeProxyUnit = pkgs.writeText "kube-proxy.service" ''
-          [Unit]
-          Description=kube-proxy
-          After=network.target kube-apiserver.service
-          [Service]
-          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetes}/bin:${pkgs.nftables}/bin
-          ExecStart=${kubernetes}/bin/kube-proxy \
+        kubeProxyRun = pkgs.writeShellScript "kube-proxy-run" ''
+          export PATH=${servicePath}:${kubernetes}/bin:${pkgs.nftables}/bin
+          ${waitFor "/etc/kubernetes/admin.conf"}
+          exec ${kubernetes}/bin/kube-proxy \
             --kubeconfig=/etc/kubernetes/admin.conf \
             --proxy-mode=nftables \
             --cluster-cidr=${podSubnet} \
             --conntrack-max-per-core=0
-          Restart=always
-          RestartSec=5
-          [Install]
-          WantedBy=multi-user.target
         '';
 
         # ── kubelet configuration ─────────────────────────────────────────────
         # clusterDNS points at the kube-dns Service IP (10.96.0.10).
         # This is the well-known convention: the 10th address in the service
         # CIDR (10.96.0.0/16 → 10.96.0.10) is reserved for kube-dns.
-        # The kube-dns Service is applied by cluster-bootstrap.service after
+        # The kube-dns Service is applied by the cluster-bootstrap service after
         # the apiserver becomes ready.
         kubeletConfig = pkgs.writeText "kubelet-config.yaml" ''
           apiVersion: kubelet.config.k8s.io/v1beta1
@@ -465,27 +392,12 @@
           net.ipv4.ip_forward=1
         '';
 
-        sysctlUnit = pkgs.writeText "u7s-sysctl.service" ''
-          [Unit]
-          Description=Apply u7s sysctls
-          Before=containerd.service kubelet.service
-          DefaultDependencies=no
-
-          [Service]
-          Type=oneshot
-          RemainAfterExit=yes
-          ExecStart=${pkgs.procps}/bin/sysctl -p /etc/sysctl.d/99-u7s.conf
-
-          [Install]
-          WantedBy=multi-user.target
-        '';
-
         # ── pod networking, all in nftables ───────────────────────────────────
         # Nothing here goes through iptables: iptables-nft needs the kernel's
         # xt_* extensions (xt_comment, xt_nat, xt_statistic, ...), which a
         # minimal host kernel may not build. kube-proxy runs in nftables mode
         # and portmap uses its nftables backend, both with `ip`-family tables.
-        # Pods are masqueraded by u7s-masquerade.service rather than by ptp's
+        # Pods are masqueraded by a table u7s-init loads rather than by ptp's
         # ipMasq: its nftables backend needs the `inet` family, which a kernel
         # without IPv6 does not have.
         podSubnet = "10.244.0.0/24";
@@ -497,21 +409,6 @@
               ip saddr ${podSubnet} ip daddr != { ${podSubnet}, 224.0.0.0/4 } masquerade
             }
           }
-        '';
-
-        masqueradeUnit = pkgs.writeText "u7s-masquerade.service" ''
-          [Unit]
-          Description=Masquerade pod traffic leaving the pod network
-          Before=containerd.service kubelet.service
-          DefaultDependencies=no
-
-          [Service]
-          Type=oneshot
-          RemainAfterExit=yes
-          ExecStart=/bin/sh -c '${pkgs.nftables}/bin/nft delete table ip u7s-masquerade 2>/dev/null; ${pkgs.nftables}/bin/nft -f ${masqueradeRules}'
-
-          [Install]
-          WantedBy=multi-user.target
         '';
 
         cniConfig = pkgs.writeText "10-u7s.conflist" ''
@@ -582,7 +479,7 @@
         # ── CoreDNS static pod manifest ───────────────────────────────────────
         # kubelet watches /etc/kubernetes/manifests/ and manages this pod
         # automatically. imagePullPolicy: Never — the image is preloaded into
-        # containerd by image-preload.service before kubelet starts.
+        # containerd by the image-preload service before kubelet starts.
         # coredns.conf uses 127.0.0.1 as the apiserver address to avoid a
         # chicken-and-egg problem where CoreDNS needs DNS to resolve u7s-node.
         coreDNSManifest = pkgs.writeText "coredns.yaml" ''
@@ -657,7 +554,7 @@
         '';
 
         # ── kube-dns Service manifest ─────────────────────────────────────────
-        # Applied by cluster-bootstrap.service after the apiserver is ready.
+        # Applied by the cluster-bootstrap service after the apiserver is ready.
         # Gives CoreDNS its well-known cluster IP (10.96.0.10) so that
         # kubelet's clusterDNS setting resolves correctly. Static pods cannot
         # self-register a Service — this is the one resource that requires a
@@ -694,27 +591,15 @@
                 targetPort: 9153
         '';
 
-        # ── image-preload systemd service ─────────────────────────────────────
-        # Runs after containerd is up, before kubelet starts.
-        # Imports all OCI tarballs from /var/lib/preload-images/ into
-        # containerd's k8s.io namespace so static pod images are available
-        # without any network access at cluster init time.
-        imagePreloadUnit = pkgs.writeText "image-preload.service" ''
-          [Unit]
-          Description=Preload bundled container images into containerd
-          After=containerd.service
-          Requires=containerd.service
-          Before=kubelet.service
-
-          [Service]
-          Type=oneshot
-          RemainAfterExit=yes
-          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${containerd}/bin
-          ExecStartPre=/bin/sh -c 'until ctr version >/dev/null 2>&1; do sleep 1; done'
-          ExecStart=/bin/sh /usr/local/bin/preload-images.sh
-
-          [Install]
-          WantedBy=multi-user.target
+        # ── image preload ─────────────────────────────────────────────────────
+        # A one-shot service: once containerd answers, it imports every OCI tarball in /var/lib/preload-images/ into
+        # containerd's k8s.io namespace, so static pod images are there without any network access at cluster init,
+        # and leaves /run/u7s/images-preloaded for the kubelet, which waits for it.
+        imagePreloadRun = pkgs.writeShellScript "image-preload-run" ''
+          export PATH=${servicePath}:${containerd}/bin
+          until ctr version >/dev/null 2>&1; do sleep 1; done
+          sh /usr/local/bin/preload-images.sh
+          touch /run/u7s/images-preloaded
         '';
 
         imagePreloadScript = pkgs.writeText "preload-images.sh" ''
@@ -736,250 +621,138 @@
           done
         '';
 
-        # ── cluster-bootstrap systemd service + path unit ──────────────────────
-        # The path unit watches for /etc/kubernetes/admin.conf to appear
-        # (written by just init's _gen-configs step) and triggers the service.
-        # This avoids boot-ordering issues — the service fires automatically
-        # whenever the kubeconfig is written, on every cluster init.
-        # kubectl apply is idempotent: safe to run on every boot.
-        clusterBootstrapUnit = pkgs.writeText "cluster-bootstrap.service" ''
-          [Unit]
-          Description=Apply core cluster bootstrap resources
-
-          [Service]
-          Type=oneshot
-          RemainAfterExit=yes
-          Environment=PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetes}/bin
-          ExecStartPre=/bin/sh -c ' \
-            until kubectl \
-              --kubeconfig /etc/kubernetes/admin.conf \
-              get nodes >/dev/null 2>&1; do \
-              echo "cluster-bootstrap: waiting for apiserver..."; \
-              sleep 3; \
-            done'
-          ExecStart=/bin/sh -c 'kubectl \
-            --kubeconfig /etc/kubernetes/admin.conf \
-            apply -f /var/lib/cluster-bootstrap/kube-dns-service.yaml'
-
-          [Install]
-          WantedBy=multi-user.target
+        # ── cluster bootstrap ─────────────────────────────────────────────────
+        # A one-shot service: it waits for /etc/kubernetes/admin.conf (written by just init's _gen-configs step) and a
+        # live apiserver, then applies the kube-dns Service. It runs at every start; kubectl apply is idempotent.
+        clusterBootstrapRun = pkgs.writeShellScript "cluster-bootstrap-run" ''
+          export PATH=${servicePath}:${kubernetes}/bin
+          ${waitFor "/etc/kubernetes/admin.conf"}
+          until kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes >/dev/null 2>&1; do
+            echo "cluster-bootstrap: waiting for apiserver..."
+            sleep 3
+          done
+          exec kubectl --kubeconfig /etc/kubernetes/admin.conf \
+            apply -f /var/lib/cluster-bootstrap/kube-dns-service.yaml
         '';
 
-        clusterBootstrapPathUnit = pkgs.writeText "cluster-bootstrap.path" ''
-          [Unit]
-          Description=Watch for kubeconfig and trigger cluster bootstrap
+        # ── the vigil layer: what vigild runs ─────────────────────────────────
+        # Each service's output is kept in vigild's memory (logs-forward: disabled), not printed to the container's
+        # stdout: podman sends that to the host's journal, and the kubelet at --v=2 would fill it. Read it with
+        # `just logs <service>` (vigil logs); nothing is written to disk, and it is gone with the container.
+        # One-shot services (image-preload, cluster-bootstrap) end Inactive when they succeed and are retried when they
+        # fail. vigild stops every service at once on SIGTERM (podman stop): the container goes down as a whole.
+        vigilLayer = pkgs.writeText "001-node.yaml" ''
+          summary: nix-usernetes node
 
-          [Path]
-          PathExists=/etc/kubernetes/admin.conf
-          Unit=cluster-bootstrap.service
+          services:
+            containerd:
+              summary: containerd container runtime
+              command: ${containerdRun}
+              startup: enabled
+              kill-delay: 10s
+              logs-forward: disabled
 
-          [Install]
-          WantedBy=multi-user.target
+            image-preload:
+              summary: import the bundled images into containerd
+              command: ${imagePreloadRun}
+              startup: enabled
+              after: [containerd]
+              on-success: ignore
+              on-failure: restart
+              logs-forward: disabled
+
+            etcd:
+              summary: etcd key-value store
+              command: ${etcdRun}
+              startup: enabled
+              kill-delay: 10s
+              logs-forward: disabled
+
+            kube-apiserver:
+              summary: Kubernetes API server
+              command: ${apiserverRun}
+              startup: enabled
+              after: [etcd]
+              kill-delay: 10s
+              logs-forward: disabled
+
+            kube-controller-manager:
+              summary: Kubernetes controller manager
+              command: ${controllerManagerRun}
+              startup: enabled
+              after: [kube-apiserver]
+              logs-forward: disabled
+
+            kube-scheduler:
+              summary: Kubernetes scheduler
+              command: ${schedulerRun}
+              startup: enabled
+              after: [kube-apiserver]
+              logs-forward: disabled
+
+            kubelet:
+              summary: kubelet
+              command: ${kubeletRun}
+              startup: enabled
+              after: [containerd, image-preload]
+              kill-delay: 20s
+              logs-forward: disabled
+
+            kube-proxy:
+              summary: kube-proxy
+              command: ${kubeProxyRun}
+              startup: enabled
+              after: [kube-apiserver]
+              logs-forward: disabled
+
+            cluster-bootstrap:
+              summary: apply the kube-dns Service
+              command: ${clusterBootstrapRun}
+              startup: enabled
+              after: [kube-apiserver]
+              on-success: ignore
+              on-failure: restart
+              logs-forward: disabled
         '';
 
-        # ── systemd units derivation ──────────────────────────────────────────
-        # pkgs.systemd does not ship unit files — they're generated by the NixOS
-        # module system. We write the minimal set needed to boot in a container
-        # as literal text, using canonical upstream unit file content.
-        systemdUnits = pkgs.runCommand "systemd-container-units" {} ''
-          mkdir -p $out/etc/systemd/system
-          mkdir -p $out/etc
+        # ── PID 1 ─────────────────────────────────────────────────────────────
+        # What the node does once, at each start, before vigild takes over as PID 1:
+        #
+        # cgroups: the container has its own cgroup v2 namespace (--cgroupns=private), and the kubelet and containerd
+        #   (cgroupfs driver) create a cgroup for every pod under its root, /k8s.io/<id>. cgroup v2 lets a cgroup hand
+        #   controllers to its children only while no process is in it, so everything already running moves to
+        #   /init.scope, where vigild and its services then stay, and every controller is enabled for the children.
+        #   systemd did the same. /init.scope is also where podman exec puts its processes.
+        # sysctls and the pod masquerade: kernel settings and an nftables table in the node's own network namespace.
+        # /etc/hosts: podman writes it at every start; the node's name resolves to itself (the kubeconfigs use it).
+        nodeInit = pkgs.writeShellScript "u7s-init" ''
+          export PATH=${servicePath}
 
-          # default.target → multi-user.target
-          ln -s multi-user.target $out/etc/systemd/system/default.target
+          cg=/sys/fs/cgroup
+          mkdir -p $cg/init.scope
+          for _ in 1 2 3; do
+            while read -r pid; do echo "$pid" > $cg/init.scope/cgroup.procs 2>/dev/null || true; done < $cg/cgroup.procs
+            [ -s $cg/cgroup.procs ] || break
+          done
+          controllers=$(sed -e 's/^/+/' -e 's/ / +/g' $cg/cgroup.controllers)
+          if ! echo "$controllers" > $cg/cgroup.subtree_control; then
+            echo "u7s-init: cannot delegate the cgroup controllers ($controllers); pods cannot start" >&2
+            exit 1
+          fi
 
-          cat > $out/etc/systemd/system/multi-user.target << 'UNIT'
-[Unit]
-Description=Multi-User System
-Documentation=man:systemd.special(7)
-Requires=basic.target
-Conflicts=rescue.service rescue.target
-After=basic.target rescue.service rescue.target
-AllowIsolate=yes
-UNIT
+          sysctl -q -p /etc/sysctl.d/99-u7s.conf || echo "u7s-init: some sysctls were not applied" >&2
+          nft delete table ip u7s-masquerade 2>/dev/null
+          nft -f ${masqueradeRules} || echo "u7s-init: the pod masquerade was not loaded" >&2
+          grep -q u7s-node /etc/hosts || echo "127.0.0.1 u7s-node" >> /etc/hosts
 
-          cat > $out/etc/systemd/system/basic.target << 'UNIT'
-[Unit]
-Description=Basic System
-Documentation=man:systemd.special(7)
-Requires=sysinit.target
-After=sysinit.target
-Wants=sockets.target timers.target paths.target
-After=sockets.target timers.target paths.target
-UNIT
+          mkdir -p /run/u7s /run/vigil
+          exec ${vigil}/bin/vigild --layers-dir /etc/vigil/layers --socket /run/vigil/vigild.sock --log-buffer 5000
+        '';
 
-          cat > $out/etc/systemd/system/sysinit.target << 'UNIT'
-[Unit]
-Description=System Initialization
-Documentation=man:systemd.special(7)
-Conflicts=emergency.service emergency.target
-After=emergency.service emergency.target
-AllowIsolate=yes
-UNIT
-
-          cat > $out/etc/systemd/system/sockets.target << 'UNIT'
-[Unit]
-Description=Sockets
-Documentation=man:systemd.special(7)
-UNIT
-
-          cat > $out/etc/systemd/system/timers.target << 'UNIT'
-[Unit]
-Description=Timers
-Documentation=man:systemd.special(7)
-UNIT
-
-          cat > $out/etc/systemd/system/paths.target << 'UNIT'
-[Unit]
-Description=Paths
-Documentation=man:systemd.special(7)
-UNIT
-
-          cat > $out/etc/systemd/system/network.target << 'UNIT'
-[Unit]
-Description=Network
-Documentation=man:systemd.special(7)
-After=network-pre.target
-UNIT
-
-          cat > $out/etc/systemd/system/network-pre.target << 'UNIT'
-[Unit]
-Description=Network (Pre)
-Documentation=man:systemd.special(7)
-UNIT
-
-          cat > $out/etc/systemd/system/network-online.target << 'UNIT'
-[Unit]
-Description=Network is Online
-Documentation=man:systemd.special(7)
-After=network.target
-UNIT
-
-          cat > $out/etc/systemd/system/local-fs.target << 'UNIT'
-[Unit]
-Description=Local File Systems
-Documentation=man:systemd.special(7)
-DefaultDependencies=no
-Conflicts=shutdown.target
-After=local-fs-pre.target
-OnFailure=emergency.target
-UNIT
-
-          cat > $out/etc/systemd/system/local-fs-pre.target << 'UNIT'
-[Unit]
-Description=Local File Systems (Pre)
-Documentation=man:systemd.special(7)
-DefaultDependencies=no
-Conflicts=shutdown.target
-UNIT
-
-          cat > $out/etc/systemd/system/swap.target << 'UNIT'
-[Unit]
-Description=Swaps
-Documentation=man:systemd.special(7)
-UNIT
-
-          cat > $out/etc/systemd/system/slices.target << 'UNIT'
-[Unit]
-Description=Slices
-Documentation=man:systemd.special(7)
-Wants=system.slice
-UNIT
-
-          cat > $out/etc/systemd/system/system.slice << 'UNIT'
-[Unit]
-Description=System Slice
-Documentation=man:systemd.special(7)
-DefaultDependencies=no
-UNIT
-
-          cat > $out/etc/systemd/system/rescue.target << 'UNIT'
-[Unit]
-Description=Rescue Mode
-Documentation=man:systemd.special(7)
-Requires=sysinit.target rescue.service
-After=sysinit.target rescue.service
-AllowIsolate=yes
-UNIT
-
-          cat > $out/etc/systemd/system/rescue.service << 'UNIT'
-[Unit]
-Description=Rescue Shell
-DefaultDependencies=no
-Conflicts=shutdown.target
-After=sysinit.target
-Before=shutdown.target
-
-[Service]
-Type=idle
-ExecStart=-/bin/sh
-StandardInput=tty-force
-StandardOutput=inherit
-StandardError=inherit
-KillMode=process
-IgnoreSIGPIPE=no
-UNIT
-
-          cat > $out/etc/systemd/system/emergency.target << 'UNIT'
-[Unit]
-Description=Emergency Mode
-Documentation=man:systemd.special(7)
-Requires=emergency.service
-After=emergency.service
-AllowIsolate=yes
-UNIT
-
-          cat > $out/etc/systemd/system/emergency.service << 'UNIT'
-[Unit]
-Description=Emergency Shell
-DefaultDependencies=no
-Conflicts=shutdown.target
-After=sysinit.target
-Before=shutdown.target
-
-[Service]
-Type=idle
-ExecStart=-/bin/sh
-StandardInput=tty-force
-StandardOutput=inherit
-StandardError=inherit
-KillMode=process
-IgnoreSIGPIPE=no
-UNIT
-
-          cat > $out/etc/systemd/system/shutdown.target << 'UNIT'
-[Unit]
-Description=Shutdown
-Documentation=man:systemd.special(7)
-DefaultDependencies=no
-AllowIsolate=yes
-UNIT
-
-          cat > $out/etc/systemd/system/reboot.target << 'UNIT'
-[Unit]
-Description=Reboot
-Documentation=man:systemd.special(7)
-DefaultDependencies=no
-Requires=shutdown.target
-After=shutdown.target
-AllowIsolate=yes
-UNIT
-
-          cat > $out/etc/systemd/system/poweroff.target << 'UNIT'
-[Unit]
-Description=Power-Off
-Documentation=man:systemd.special(7)
-DefaultDependencies=no
-Requires=shutdown.target
-After=shutdown.target
-AllowIsolate=yes
-UNIT
-
-          # os-release
-          printf 'ID=nix-usernetes
-NAME=nix-usernetes
-PRETTY_NAME="nix-usernetes"
-'             > $out/etc/os-release
+        nodeEtc = pkgs.runCommand "u7s-node-etc" {} ''
+          mkdir -p $out/etc/vigil/layers
+          cp ${vigilLayer} $out/etc/vigil/layers/001-node.yaml
+          printf 'ID=nix-usernetes\nNAME=nix-usernetes\nPRETTY_NAME="nix-usernetes"\n' > $out/etc/os-release
         '';
 
         # ── OCI layer image ───────────────────────────────────────────────────
@@ -1014,13 +787,13 @@ PRETTY_NAME="nix-usernetes"
             socat
             util-linux
 
-            # All control plane components run as native systemd units
+            # The control plane runs on the node, as services of vigild (PID 1)
             kubernetes
             etcd
             helm
 
-            systemd
-            systemdUnits
+            vigil
+            nodeEtc
           ];
 
           fakeRootCommands = ''
@@ -1071,7 +844,7 @@ PRETTY_NAME="nix-usernetes"
             cp ${coreDNSManifest} etc/kubernetes/manifests/coredns.yaml
 
             # ── Cluster bootstrap resources ────────────────────────────────────
-            # Applied by cluster-bootstrap.service after apiserver is ready.
+            # Applied by the cluster-bootstrap service after apiserver is ready.
             mkdir -p var/lib/cluster-bootstrap
             cp ${kubeDNSServiceManifest} var/lib/cluster-bootstrap/kube-dns-service.yaml
 
@@ -1079,45 +852,6 @@ PRETTY_NAME="nix-usernetes"
             mkdir -p usr/local/bin
             cp ${imagePreloadScript} usr/local/bin/preload-images.sh
             chmod +x usr/local/bin/preload-images.sh
-
-            # ── systemd units ──────────────────────────────────────────────────
-            mkdir -p etc/systemd/system/multi-user.target.wants
-
-            cp ${containerdUnit}        etc/systemd/system/containerd.service
-            cp ${etcdUnit}              etc/systemd/system/etcd.service
-            cp ${apiserverUnit}         etc/systemd/system/kube-apiserver.service
-            cp ${controllerManagerUnit} etc/systemd/system/kube-controller-manager.service
-            cp ${schedulerUnit}         etc/systemd/system/kube-scheduler.service
-            cp ${kubeletUnit}           etc/systemd/system/kubelet.service
-            cp ${kubeProxyUnit}         etc/systemd/system/kube-proxy.service
-            cp ${sysctlUnit}            etc/systemd/system/u7s-sysctl.service
-            cp ${masqueradeUnit}        etc/systemd/system/u7s-masquerade.service
-            cp ${imagePreloadUnit}      etc/systemd/system/image-preload.service
-            cp ${clusterBootstrapUnit}  etc/systemd/system/cluster-bootstrap.service
-            cp ${clusterBootstrapPathUnit} etc/systemd/system/cluster-bootstrap.path
-
-            ln -sf /etc/systemd/system/containerd.service \
-              etc/systemd/system/multi-user.target.wants/containerd.service
-            ln -sf /etc/systemd/system/etcd.service \
-              etc/systemd/system/multi-user.target.wants/etcd.service
-            ln -sf /etc/systemd/system/kube-apiserver.service \
-              etc/systemd/system/multi-user.target.wants/kube-apiserver.service
-            ln -sf /etc/systemd/system/kube-controller-manager.service \
-              etc/systemd/system/multi-user.target.wants/kube-controller-manager.service
-            ln -sf /etc/systemd/system/kube-scheduler.service \
-              etc/systemd/system/multi-user.target.wants/kube-scheduler.service
-            ln -sf /etc/systemd/system/kubelet.service \
-              etc/systemd/system/multi-user.target.wants/kubelet.service
-            ln -sf /etc/systemd/system/kube-proxy.service \
-              etc/systemd/system/multi-user.target.wants/kube-proxy.service
-            ln -sf /etc/systemd/system/u7s-sysctl.service \
-              etc/systemd/system/multi-user.target.wants/u7s-sysctl.service
-            ln -sf /etc/systemd/system/u7s-masquerade.service \
-              etc/systemd/system/multi-user.target.wants/u7s-masquerade.service
-            ln -sf /etc/systemd/system/image-preload.service \
-              etc/systemd/system/multi-user.target.wants/image-preload.service
-            ln -sf /etc/systemd/system/cluster-bootstrap.path \
-              etc/systemd/system/multi-user.target.wants/cluster-bootstrap.path
 
             # Standard dirs
             mkdir -p var/lib/kubelet var/lib/etcd
@@ -1130,19 +864,20 @@ PRETTY_NAME="nix-usernetes"
           '';
 
           config = {
-            Cmd        = [ "/sbin/init" ];
+            Cmd        = [ "${nodeInit}" ];
             Entrypoint = [];
+            # vigild stops every service on SIGTERM, then exits.
+            StopSignal = "SIGTERM";
             Env = [
-              "container=docker"
               "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
               "SSL_CERT_DIR=/etc/ssl/certs"
               "PATH=/bin:/sbin:/usr/bin:/usr/sbin:${kubernetes}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin"
               "KUBECONFIG=/etc/kubernetes/admin.conf"
             ];
+            # The node's state. Not /sys/fs/cgroup, /lib/modules or /run, which `just up` mounts (the cgroup filesystem, the
+            # host's modules, a tmpfs): as image volumes each was also an anonymous volume, a new one at every `podman run`
+            # and left behind by `podman rm`.
             Volumes = {
-              "/sys/fs/cgroup"        = {};
-              "/lib/modules"          = {};
-              "/run"                  = {};
               "/etc/kubernetes"       = {};
               "/var/lib/kubelet"      = {};
               "/var/lib/etcd"         = {};

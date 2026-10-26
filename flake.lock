@@ -37,7 +37,8 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "vigil-rs": "vigil-rs"
       }
     },
     "systems": {
@@ -52,6 +53,29 @@
       "original": {
         "owner": "nix-systems",
         "repo": "default",
+        "type": "github"
+      }
+    },
+    "vigil-rs": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792973718,
+        "narHash": "sha256-E1Nm2FHUz4C9EEVEX8Q/Gc32RgFGg3HpK9w5XdThXRA=",
+        "owner": "daveman1010221",
+        "repo": "vigil-rs-nix",
+        "rev": "012b7e551f38f89407b4f424defaab43c8f81985",
+        "type": "github"
+      },
+      "original": {
+        "owner": "daveman1010221",
+        "repo": "vigil-rs-nix",
         "type": "github"
       }
     }
