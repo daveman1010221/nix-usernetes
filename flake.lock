@@ -32,11 +32,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1792979351,
-        "narHash": "sha256-AFJ4oGQ6fYp3a/ENe5UEsLBqfM26Xp76r2HSw5PIcOk=",
+        "lastModified": 1793050225,
+        "narHash": "sha256-5k+2SB1qFmGckVWjkgjqBY1boYNAf2/sc2+/fdq3ZXc=",
         "owner": "daveman1010221",
         "repo": "nix-container-lib",
-        "rev": "6c86c19101123245354a39bbf571b6f100770dc1",
+        "rev": "7db6e5d52c28f7bc487c549d204c7a37ce10d431",
         "type": "github"
       },
       "original": {
