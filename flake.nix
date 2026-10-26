@@ -689,6 +689,14 @@
             # tools that look in /sbin find them in /bin (every package here has its sbin tools in bin too)
             [ -e sbin ] || ln -s bin sbin
 
+            # Protocol names (tcp is 6), for nft. kube-proxy reads its maps back with `nft --json` and keys their
+            # elements by protocol name (10.96.0.1 . tcp . 443); without this file nft lists the protocol as a number
+            # (10.96.0.1 . 6 . 443), so at every full sync over an existing table (a kube-proxy restart, a retry after
+            # a failed sync, the periodic one) kube-proxy took each element it read back for a leftover and deleted
+            # it, while keeping it as present: Services silently unprogrammed, and the next sync that deleted one by
+            # its own key refused whole ("delete element ... No such file or directory").
+            cp ${pkgs.iana-etc}/etc/protocols etc/protocols
+
             # containerd config
             mkdir -p etc/containerd
             cp ${containerdConfig} etc/containerd/config.toml
