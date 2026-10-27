@@ -130,22 +130,23 @@ kubeconfig: _check-running
 
 # ── private bootstrap steps ──────────────────────────────────────────────────
 
-_check-running:
-    @podman inspect {{CONTAINER}} --format '{{{{.State.Running}}}}' 2>/dev/null \
+_check-running container=CONTAINER:
+    @podman inspect {{container}} --format '{{{{.State.Running}}}}' 2>/dev/null \
         | grep -q true \
-        || (echo "Container '{{CONTAINER}}' is not running. Run 'just up' first." && exit 1)
+        || (echo "Container '{{container}}' is not running. Run 'just up' first." && exit 1)
 
-# Generate all PKI certificates into the u7s-pki volume (/etc/kubernetes/pki).
-_gen-pki: _check-running
+# Generate all PKI certificates into the node's pki volume (/etc/kubernetes/pki): u7s's, or a cluster's control plane's
+# (cluster.sh).
+_gen-pki container=CONTAINER node=NODE_NAME: (_check-running container)
     #!/usr/bin/env bash
     set -euo pipefail
-    if podman exec {{CONTAINER}} test -f /etc/kubernetes/pki/ca.crt 2>/dev/null; then
+    if podman exec {{container}} test -f /etc/kubernetes/pki/ca.crt 2>/dev/null; then
         echo "PKI already exists, skipping."
         exit 0
     fi
-    CONTAINER_IP=$(podman exec {{CONTAINER}} ip -4 addr show tap0 | grep "inet " | head -1 | sed 's|.*inet \([0-9.]*\)/.*|\1|')
+    CONTAINER_IP=$(podman exec {{container}} u7s-node-ip)
     echo "Generating PKI..."
-    podman exec --env CONTAINER_IP="$CONTAINER_IP" --env NODE_NAME={{NODE_NAME}} {{CONTAINER}} bash -euc '
+    podman exec --env CONTAINER_IP="$CONTAINER_IP" --env NODE_NAME={{node}} {{container}} bash -euc '
         set -euo pipefail
         mkdir -p /etc/kubernetes/pki/etcd
 
@@ -242,10 +243,10 @@ _gen-pki: _check-running
     '
 
 # Generate kubeconfig files for each component.
-_gen-configs: _check-running
+_gen-configs container=CONTAINER node=NODE_NAME: (_check-running container)
     #!/usr/bin/env bash
     set -euo pipefail
-    if podman exec {{CONTAINER}} test -f /etc/kubernetes/admin.conf 2>/dev/null; then
+    if podman exec {{container}} test -f /etc/kubernetes/admin.conf 2>/dev/null; then
         echo "Kubeconfigs already exist, skipping."
         exit 0
     fi
@@ -253,9 +254,9 @@ _gen-configs: _check-running
     write_kubeconfig() {
         local dest="$1" user="$2" cert="$3" key="$4" server="$5"
         local ca cert_data key_data
-        ca=$(podman exec {{CONTAINER}} base64 -w0 /etc/kubernetes/pki/ca.crt)
-        cert_data=$(podman exec {{CONTAINER}} base64 -w0 /etc/kubernetes/pki/${cert}.crt)
-        key_data=$(podman exec {{CONTAINER}} base64 -w0 /etc/kubernetes/pki/${key}.key)
+        ca=$(podman exec {{container}} base64 -w0 /etc/kubernetes/pki/ca.crt)
+        cert_data=$(podman exec {{container}} base64 -w0 /etc/kubernetes/pki/${cert}.crt)
+        key_data=$(podman exec {{container}} base64 -w0 /etc/kubernetes/pki/${key}.key)
         local yaml
         yaml="apiVersion: v1"$'\n'
         yaml+="kind: Config"$'\n'
@@ -275,19 +276,19 @@ _gen-configs: _check-running
         yaml+="  user:"$'\n'
         yaml+="    client-certificate-data: ${cert_data}"$'\n'
         yaml+="    client-key-data: ${key_data}"$'\n'
-        printf '%s' "$yaml" | podman exec -i {{CONTAINER}} bash -c "cat > ${dest}"
+        printf '%s' "$yaml" | podman exec -i {{container}} bash -c "cat > ${dest}"
     }
     write_kubeconfig /etc/kubernetes/admin.conf \
-        kubernetes-admin admin admin "https://{{NODE_NAME}}:{{PORT_APISERVER}}"
-    CONTAINER_IP=$(podman exec {{CONTAINER}} ip -4 addr show tap0 | grep "inet " | head -1 | sed 's|.*inet \([0-9.]*\)/.*|\1|')
+        kubernetes-admin admin admin "https://{{node}}:{{PORT_APISERVER}}"
+    CONTAINER_IP=$(podman exec {{container}} u7s-node-ip)
     write_kubeconfig /etc/kubernetes/coredns.conf \
     kubernetes-admin admin admin "https://${CONTAINER_IP}:{{PORT_APISERVER}}"
     write_kubeconfig /etc/kubernetes/controller-manager.conf \
-        system:kube-controller-manager controller-manager-client controller-manager-client "https://{{NODE_NAME}}:{{PORT_APISERVER}}"
+        system:kube-controller-manager controller-manager-client controller-manager-client "https://{{node}}:{{PORT_APISERVER}}"
     write_kubeconfig /etc/kubernetes/scheduler.conf \
-        system:kube-scheduler scheduler-client scheduler-client "https://{{NODE_NAME}}:{{PORT_APISERVER}}"
+        system:kube-scheduler scheduler-client scheduler-client "https://{{node}}:{{PORT_APISERVER}}"
     write_kubeconfig /etc/kubernetes/kubelet.conf \
-        "system:node:{{NODE_NAME}}" kubelet-client kubelet-client "https://{{NODE_NAME}}:{{PORT_APISERVER}}"
+        "system:node:{{node}}" kubelet-client kubelet-client "https://{{node}}:{{PORT_APISERVER}}"
     echo "Kubeconfigs written."
 
 # Wait for apiserver and remove the control-plane taint so pods schedule on this node.
@@ -318,12 +319,12 @@ _untaint: _check-running
 
 # Pre-pull images into the cluster containerd. Uses local podman cache if available.
 # CoreDNS is bundled in the node image itself and does not need to be listed here.
-_prepull-images: _check-running
+_prepull-images container=CONTAINER: (_check-running container)
     #!/usr/bin/env bash
     set -euo pipefail
     for img in \
         registry.k8s.io/pause:3.10.2; do
-        if podman exec {{CONTAINER}} ctr -n k8s.io images check "$img" &>/dev/null; then
+        if podman exec {{container}} ctr -n k8s.io images check "$img" &>/dev/null; then
             echo "Image $img already in cluster, skipping."
             continue
         fi
@@ -332,7 +333,7 @@ _prepull-images: _check-running
             podman pull "$img"
         fi
         echo "Loading $img into cluster..."
-        podman save "$img" | podman exec -i {{CONTAINER}} ctr -n k8s.io images import -
+        podman save "$img" | podman exec -i {{container}} ctr -n k8s.io images import -
     done
 
 # ── cert-manager (Polar concern) ──────────────────────────────────────────────
@@ -419,7 +420,41 @@ debug-pod pod: _check-running
 load-node-image:
     podman load -i result-node-image
 
-# Render node.dhall (what the node runs: its packages, boot steps and services) to node.nix, which nix build reads.
-# Commit both. Needs dhall-to-nix (nix shell nixpkgs#dhall-nix) and the network, for the library's prelude.
+# Load the worker image, for a cluster's workers, after `nix build .#worker-image -o result-worker-image`.
+load-worker-image:
+    podman load -i result-worker-image
+
+# Render node.dhall and worker.dhall (what a node runs: its packages, boot steps and services) to node.nix and
+# worker.nix, which nix build reads. Commit them all. Needs dhall-to-nix (nix shell nixpkgs#dhall-nix) and the
+# network, for the library's prelude.
 render:
     dhall-to-nix < node.dhall > node.nix
+    dhall-to-nix < worker.dhall > worker.nix
+
+# ── a cluster of nodes (cluster.dhall, cluster.sh) ───────────────────────────────────────────────────────────────────
+# One control plane and workers, each its own container, on a network of their own; u7s above is separate, and the two
+# can run side by side. The images: node-image (the control plane) and worker-image, built and loaded as above.
+
+# Start the cluster: the hub, the nodes' network, the nodes. Idempotent, as `up` is.
+cluster-up:
+    ./cluster.sh up
+
+# Once, after the first `cluster-up`: the control plane's PKI and kubeconfigs, the workers joined, labels and taints.
+cluster-init:
+    ./cluster.sh init
+
+# Write kubeconfig-<cluster>, which reaches the apiserver on the host's apiserverPort (cluster.dhall).
+cluster-kubeconfig:
+    ./cluster.sh kubeconfig
+
+# The cluster's containers and nodes.
+cluster-status:
+    ./cluster.sh status
+
+# Stop and remove the nodes and the hub. The cluster's state stays on its volumes.
+cluster-down:
+    ./cluster.sh down
+
+# cluster-down, and wipe the cluster's volumes and kubeconfig.
+cluster-reset:
+    ./cluster.sh reset

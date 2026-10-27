@@ -80,6 +80,47 @@ just reset       # stop the node and wipe all state, persistent volumes included
 A node image with a Kubernetes minor version more than one ahead of the cluster's needs `reset`, not `restart`: the
 control plane and etcd are upgraded one minor version at a time.
 
+## A cluster of nodes
+
+`cluster.dhall` describes a cluster on the same host: one control plane and any number of workers, each its own
+container, with labels and taints per node. It runs beside the single node (u7s), under its own names (`u7c-*`) and
+on its own apiserver port (7443).
+
+```bash
+nix build .#node-image -o result-node-image && just load-node-image       # the control plane
+nix build .#worker-image -o result-worker-image && just load-worker-image # the workers
+nix develop        # cluster.sh needs dhall-to-json, ip, nft, nsenter and unshare
+just cluster-up    # the hub, the nodes' network, the nodes
+just cluster-init  # once: the control plane's PKI, the workers joined, labels and taints
+just cluster-kubeconfig
+export KUBECONFIG=$(pwd)/kubeconfig-u7c
+kubectl get nodes -o wide
+```
+
+`just cluster-down` stops and removes the nodes and keeps their volumes (`u7c-<node>-pki`, `-kubelet`, ...);
+`just cluster-up` brings them back without another init. `just cluster-reset` wipes them.
+
+**The network.** Rootless podman's bridge networks need iptables extensions (`xt_comment`, `xt_nat`) or nftables'
+`inet` family, which a kernel without IPv6 does not have, so the cluster brings its own, built inside podman's rootless
+user namespace with no privilege beyond what the user already has there:
+
+```
+host ──slirp4netns── hub (10.0.2.100)          masquerades the nodes out, their DNS to the host's resolver,
+                     └── br0 10.77.0.1/24      the host's :7443 to the control plane's apiserver
+                         ├── veth ── cp    10.77.0.11   pods 10.244.0.0/24
+                         └── veth ── core  10.77.0.12   pods 10.244.1.0/24
+```
+
+Each node's network namespace is kept on a file under `$XDG_RUNTIME_DIR/nix-usernetes/<cluster>/netns`, wired to the
+hub's bridge before the node starts, and joined by the node's container (`--network ns:`), so a node that restarts
+keeps its network. A hub that restarts takes its ends of the veth pairs with it: `just cluster-up` wires the nodes
+again. Every node routes each other node's pod range through that node, so pods reach each other directly, without NAT.
+
+**What differs by role.** `node.dhall` (the control plane, and u7s) and `worker.dhall` take their services from
+`node-common.dhall`: a worker runs containerd, the kubelet and kube-proxy, and its image carries no CoreDNS and no
+cluster bootstrap. A node's identity reaches it in the environment (`NODE_NAME`, `NODE_IP`, `POD_CIDR`); a worker's
+kubelet and kube-proxy have their own certificates, signed by the control plane's CA when it joins.
+
 ## Just targets
 
 | Target | Description |
@@ -93,34 +134,39 @@ control plane and etcd are upgraded one minor version at a time.
 | `just shell` | Open a shell inside the node container |
 | `just logs [service...]` | Follow the services' logs (kept in memory by vigild, the last 5000 lines of each) |
 | `just status` | Show the services' state (`vigil services list`) and the node's pods |
-| `just render` | Render `node.dhall` to `node.nix` after changing what the node runs |
+| `just render` | Render `node.dhall` and `worker.dhall` to `node.nix` and `worker.nix` after changing what a node runs |
+| `just cluster-up` / `cluster-down` / `cluster-reset` | Start, stop, or wipe the cluster of `cluster.dhall` |
+| `just cluster-init` | Once: the control plane's PKI, the workers joined, labels and taints applied |
+| `just cluster-kubeconfig` / `cluster-status` | Write `./kubeconfig-<cluster>`; show the cluster's containers and nodes |
 
 ## Architecture
 
 The node is a [nix-container-lib](https://github.com/daveman1010221/nix-container-lib) `System` container: vigild is PID 1 and runs the node's services, with no session (no user, no shell in front, no SSH).
 
 ```
-node.dhall  →  just render  →  node.nix          what the node runs
+node-common.dhall                                 what every node has
 ├── packages      (a custom layer: containerd, etcd, iproute2, nftables, ...)
 ├── boot steps    (once at each start: delegate the cgroups, sysctls, the pod masquerade, u7s-prepare)
 └── services      (vigild's: containerd, etcd, kube-apiserver, ..., each running /bin/u7s-<service>)
+node.dhall    →  just render  →  node.nix         the control plane (and u7s): all of the services
+worker.dhall  →  just render  →  worker.nix       a worker: containerd, the kubelet, kube-proxy
 
 flake.nix                                         what those are made of
 ├── kubernetes  (stdenv.mkDerivation)
 │   ├── src: kubernetes-v1.37.1.tar.gz
 │   └── buildPhase: go build -mod=vendor CGO_ENABLED=0
 ├── the services' scripts (/bin/u7s-*), each waiting for what it needs before it starts
-└── nodeImage  (nix-container-lib mkContainer, from node.nix)
-    └── the files the node carries: containerd's, the kubelet's and CNI's configuration, CoreDNS
+└── nodeImage, workerImage  (nix-container-lib mkContainer, from node.nix and worker.nix)
+    └── the files a node carries: containerd's, the kubelet's and CNI's configuration (the control plane's: CoreDNS)
 ```
 
-After changing `node.dhall`, run `just render` and commit `node.nix` with it.
+After changing a `.dhall` file, run `just render` and commit the `.nix` files with it.
 
 **Bootstrap flow (`just init`):**
 1. Generate PKI with openssl inside the container
 2. Write kubeconfigs for all components
 3. The control plane services, each waiting for its files, start on their own; kube-apiserver reads the node's
-   address from `tap0` before every start
+   address (`NODE_IP`, or the one slirp4netns gives u7s on `tap0`) before every start
 4. Wait for apiserver readiness
 5. Remove control-plane taint so workloads schedule
 6. Prepull the pause image

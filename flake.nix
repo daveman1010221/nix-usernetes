@@ -189,6 +189,20 @@
         servicePath = "/bin:/sbin:/usr/bin:/usr/sbin";
         waitFor = path: ''until [ -e ${path} ]; do sleep 2; done'';
 
+        # The node's address, in NODE_IP: a cluster's node is given its own (cluster.sh, its veth on the hub's bridge);
+        # the single node of `just up` has the one slirp4netns gives it on tap0 (10.0.2.100), read at every start, so
+        # nothing about it is kept in the container.
+        nodeIp = ''
+          if [ -z "''${NODE_IP:-}" ]; then
+            for _ in $(seq 1 30); do
+              set -- $(ip -4 -o addr show dev tap0 2>/dev/null)
+              if [ -n "''${4:-}" ]; then NODE_IP=''${4%/*}; break; fi
+              sleep 1
+            done
+          fi
+          if [ -z "''${NODE_IP:-}" ]; then echo "$0: no NODE_IP given, and tap0 has no IPv4 address" >&2; exit 1; fi
+        '';
+
         containerdRun = pkgs.writeShellScriptBin "u7s-containerd" ''
           export PATH=${servicePath}:${containerd}/bin:${runc}/bin:${cri-tools}/bin:${pkgs.rootlesskit}/bin:${pkgs.slirp4netns}/bin
           modprobe overlay 2>/dev/null || true
@@ -216,21 +230,14 @@
             --snapshot-count=10000
         '';
 
-        # The apiserver advertises the address slirp4netns gives the node (10.0.2.100), read from tap0 at every start,
-        # so nothing about it is kept in the container: one that is removed and created again (`just restart`, or by
-        # hand) starts as it did.
+        # The apiserver advertises the node's address, so a node that is removed and created again (`just restart`, or
+        # by hand) starts as it did.
         apiserverRun = pkgs.writeShellScriptBin "u7s-kube-apiserver" ''
           export PATH=${servicePath}
           ${waitFor "/etc/kubernetes/pki/apiserver.crt"}
-          HOST_IP=
-          for _ in $(seq 1 30); do
-            set -- $(ip -4 -o addr show dev tap0 2>/dev/null)
-            if [ -n "''${4:-}" ]; then HOST_IP=''${4%/*}; break; fi
-            sleep 1
-          done
-          if [ -z "$HOST_IP" ]; then echo "kube-apiserver: tap0 has no IPv4 address" >&2; exit 1; fi
+          ${nodeIp}
           exec ${kubernetes}/bin/kube-apiserver \
-            --advertise-address="$HOST_IP" \
+            --advertise-address="$NODE_IP" \
             --bind-address=0.0.0.0 \
             --allow-privileged=true \
             --authorization-mode=Node,RBAC \
@@ -262,9 +269,11 @@
         controllerManagerRun = pkgs.writeShellScriptBin "u7s-kube-controller-manager" ''
           export PATH=${servicePath}
           ${waitFor "/etc/kubernetes/controller-manager.conf"}
+          # Each node's pod range is given to it (POD_CIDR, read by u7s-prepare into CNI's host-local IPAM), so none is
+          # allocated here: one allocated in the order nodes register would not be the range the node uses.
           exec ${kubernetes}/bin/kube-controller-manager \
-            --allocate-node-cidrs=true \
-            --cluster-cidr=10.244.0.0/16 \
+            --allocate-node-cidrs=false \
+            --cluster-cidr=${clusterCidr} \
             --cluster-name=kubernetes \
             --cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt \
             --cluster-signing-key-file=/etc/kubernetes/pki/ca.key \
@@ -291,19 +300,25 @@
           export PATH=${servicePath}:${kubernetes}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin
           ${waitFor "/etc/kubernetes/kubelet.conf"}
           ${waitFor "/run/u7s/images-preloaded"}
+          ${nodeIp}
           exec ${kubernetes}/bin/kubelet \
             --config=/etc/kubelet/kubelet-config.yaml \
             --kubeconfig=/etc/kubernetes/kubelet.conf \
+            --node-ip="$NODE_IP" \
             --v=2
         '';
 
+        # A worker has its own kubeconfig (kube-proxy.conf, written by `just cluster-init`); the control plane uses the
+        # admin's, as the single node always has.
         kubeProxyRun = pkgs.writeShellScriptBin "u7s-kube-proxy" ''
           export PATH=${servicePath}:${kubernetes}/bin:${pkgs.nftables}/bin
-          ${waitFor "/etc/kubernetes/admin.conf"}
+          until [ -e /etc/kubernetes/kube-proxy.conf ] || [ -e /etc/kubernetes/admin.conf ]; do sleep 2; done
+          config=/etc/kubernetes/admin.conf
+          [ -e /etc/kubernetes/kube-proxy.conf ] && config=/etc/kubernetes/kube-proxy.conf
           exec ${kubernetes}/bin/kube-proxy \
-            --kubeconfig=/etc/kubernetes/admin.conf \
+            --kubeconfig="$config" \
             --proxy-mode=nftables \
-            --cluster-cidr=${podSubnet} \
+            --cluster-cidr=${clusterCidr} \
             --conntrack-max-per-core=0
         '';
 
@@ -378,12 +393,12 @@
         # which the node pulls from as localhost:30500, a NodePort. kube-proxy's
         # nftables mode serves NodePorts on the node's addresses but not on
         # 127.0.0.1 (iptables mode did, through route_localnet), so containerd
-        # sends those pulls to the same NodePort on the node's own address:
-        # 10.0.2.100, the address slirp4netns gives the container.
-        inClusterRegistryHostsToml = pkgs.writeText "hosts.toml" ''
-          server = "http://10.0.2.100:30500"
+        # sends those pulls to the same NodePort on the node's own address.
+        # A template: u7s-prepare writes it with the node's address at every start.
+        inClusterRegistryHostsToml = pkgs.writeText "hosts.toml.in" ''
+          server = "http://@NODE_IP@:30500"
 
-          [host."http://10.0.2.100:30500"]
+          [host."http://@NODE_IP@:30500"]
             capabilities = ["pull", "resolve"]
         '';
 
@@ -399,21 +414,26 @@
         # xt_* extensions (xt_comment, xt_nat, xt_statistic, ...), which a
         # minimal host kernel may not build. kube-proxy runs in nftables mode
         # and portmap uses its nftables backend, both with `ip`-family tables.
-        # Pods are masqueraded by a table u7s-init loads rather than by ptp's
+        # Pods are masqueraded by a table a boot step loads rather than by ptp's
         # ipMasq: its nftables backend needs the `inet` family, which a kernel
         # without IPv6 does not have.
-        podSubnet = "10.244.0.0/24";
+        #
+        # Every node has its own /24 of the cluster's range (POD_CIDR; the single
+        # node's is the first), and reaches the others' through their nodes
+        # (routes cluster.sh adds), so traffic between pods is never masqueraded.
+        clusterCidr = "10.244.0.0/16";
 
         masqueradeRules = pkgs.writeText "u7s-masquerade.nft" ''
           table ip u7s-masquerade {
             chain postrouting {
               type nat hook postrouting priority srcnat; policy accept;
-              ip saddr ${podSubnet} ip daddr != { ${podSubnet}, 224.0.0.0/4 } masquerade
+              ip saddr ${clusterCidr} ip daddr != { ${clusterCidr}, 224.0.0.0/4 } masquerade
             }
           }
         '';
 
-        cniConfig = pkgs.writeText "10-u7s.conflist" ''
+        # A template: u7s-prepare writes it with the node's pod range at every start.
+        cniConfig = pkgs.writeText "10-u7s.conflist.in" ''
           {
             "cniVersion": "1.0.0",
             "name": "u7s",
@@ -423,7 +443,7 @@
                 "ipMasq": false,
                 "ipam": {
                   "type": "host-local",
-                  "ranges": [[{ "subnet": "${podSubnet}" }]],
+                  "ranges": [[{ "subnet": "@POD_CIDR@" }]],
                   "routes": [{ "dst": "0.0.0.0/0" }]
                 }
               },
@@ -638,18 +658,33 @@
         '';
 
         # ── boot step: prepare ────────────────────────────────────────────────
-        # node.dhall's boot steps run once, at each start, before vigild: the cgroup delegation, the sysctls and the pod
-        # masquerade come from nix-container-lib; this does the rest. podman writes /etc/hosts at every start, and the
-        # node's name resolves to itself (the kubeconfigs use it). /run (a tmpfs) holds what the services hand each other.
+        # node-common.dhall's boot steps run once, at each start, before vigild: the cgroup delegation, the sysctls and
+        # the pod masquerade come from nix-container-lib; this does the rest. podman writes /etc/hosts at every start,
+        # and the node's name resolves to itself (the control plane's kubeconfigs use it). The files that hold the
+        # node's address and pod range are written from their templates. /run (a tmpfs) holds what the services hand
+        # each other.
         nodePrepare = pkgs.writeShellScriptBin "u7s-prepare" ''
           export PATH=${servicePath}
-          grep -q u7s-node /etc/hosts || echo "127.0.0.1 u7s-node" >> /etc/hosts
+          set -eu
+          name=''${NODE_NAME:-u7s-node}
+          grep -qw "$name" /etc/hosts || echo "127.0.0.1 $name" >> /etc/hosts
+          ${nodeIp}
+          sed "s|@POD_CIDR@|''${POD_CIDR:-10.244.0.0/24}|" /etc/u7s/10-u7s.conflist.in > /etc/cni/net.d/10-u7s.conflist
+          sed "s|@NODE_IP@|$NODE_IP|" /etc/u7s/registry-hosts.toml.in > /etc/containerd/certs.d/localhost:30500/hosts.toml
           mkdir -p /run/u7s
+        '';
+
+        # The node's address, for `just` (the apiserver's certificate, CoreDNS's kubeconfig).
+        nodeIpRun = pkgs.writeShellScriptBin "u7s-node-ip" ''
+          export PATH=${servicePath}
+          ${nodeIp}
+          echo "$NODE_IP"
         '';
 
         nodeScripts = pkgs.symlinkJoin {
           name  = "u7s-node-scripts";
           paths = [
+            nodeIpRun
             nodePrepare
             containerdRun
             imagePreloadRun
@@ -663,14 +698,14 @@
           ];
         };
 
-        # ── OCI image ─────────────────────────────────────────────────────────
-        # A nix-container-lib System container, from node.dhall (rendered to node.nix). The library makes start.nu, which
-        # runs the boot steps, writes vigild's layer from the services, and execs vigild as PID 1; this adds what the
-        # node is made of.
-        node = nix-container-lib.lib.${system}.mkContainer {
-          inherit system pkgs;
+        # ── OCI images ────────────────────────────────────────────────────────
+        # nix-container-lib System containers, from node.dhall and worker.dhall (rendered to node.nix and worker.nix).
+        # The library makes start.nu, which runs the boot steps, writes vigild's layer from the services, and execs
+        # vigild as PID 1; this adds what a node is made of. A worker carries the same files but no static pods and no
+        # cluster bootstrap: CoreDNS and the kube-dns Service are the control plane's.
+        mkNode = { configNixPath, controlPlane }: nix-container-lib.lib.${system}.mkContainer {
+          inherit system pkgs configNixPath;
           inputs        = { inherit vigil-rs; };
-          configNixPath = ./node.nix;
           tag           = k8sVersion;
 
           extraDerivations = [
@@ -694,13 +729,14 @@
             cp ${containerdConfig} etc/containerd/config.toml
             mkdir -p etc/containerd/certs.d/10.0.2.2:5000
             cp ${localRegistryHostsToml} etc/containerd/certs.d/10.0.2.2:5000/hosts.toml
+            # written by u7s-prepare from the template, with the node's address
             mkdir -p etc/containerd/certs.d/localhost:30500
-            cp ${inClusterRegistryHostsToml} etc/containerd/certs.d/localhost:30500/hosts.toml
 
-            # boot steps' files (node.dhall)
+            # boot steps' files (node-common.dhall)
             mkdir -p etc/sysctl.d etc/u7s
             cp ${sysctlConfig} etc/sysctl.d/99-u7s.conf
             cp ${masqueradeRules} etc/u7s/masquerade.nft
+            cp ${inClusterRegistryHostsToml} etc/u7s/registry-hosts.toml.in
 
             # CNI binaries
             mkdir -p opt/cni/bin
@@ -708,9 +744,9 @@
               ln -sf "$f" opt/cni/bin/$(basename "$f")
             done
 
-            # CNI config
+            # CNI config: written by u7s-prepare from the template, with the node's pod range
             mkdir -p etc/cni/net.d
-            cp ${cniConfig} etc/cni/net.d/10-u7s.conflist
+            cp ${cniConfig} etc/u7s/10-u7s.conflist.in
 
             # kubelet config — kept outside /etc/kubernetes so the u7s-pki
             # volume mount doesn't shadow it
@@ -719,6 +755,7 @@
 
             # /etc/kubernetes is populated at runtime by just init
             mkdir -p etc/kubernetes/manifests etc/kubernetes/pki
+          '' + pkgs.lib.optionalString controlPlane ''
 
             # ── CoreDNS ────────────────────────────────────────────────────────
             # Corefile — mounted as hostPath by the CoreDNS static pod
@@ -736,6 +773,7 @@
             # Applied by the cluster-bootstrap service after apiserver is ready.
             mkdir -p var/lib/cluster-bootstrap
             cp ${kubeDNSServiceManifest} var/lib/cluster-bootstrap/kube-dns-service.yaml
+          '' + ''
 
             # Standard dirs
             mkdir -p var/lib/kubelet var/lib/etcd
@@ -753,18 +791,23 @@
             Volumes = {
               "/etc/kubernetes"       = {};
               "/var/lib/kubelet"      = {};
-              "/var/lib/etcd"         = {};
               "/var/lib/containerd"   = {};
               "/opt/local-path-provisioner" = {};
+            } // pkgs.lib.optionalAttrs controlPlane {
+              "/var/lib/etcd"         = {};
             };
             Labels = {
-              "org.opencontainers.image.description" = "Single-node rootless Kubernetes for developer workstations";
+              "org.opencontainers.image.description" =
+                if controlPlane
+                then "Rootless Kubernetes for developer workstations: a single node, or a cluster's control plane"
+                else "Rootless Kubernetes for developer workstations: a cluster's worker node";
               "org.opencontainers.image.version"     = k8sVersion;
             };
           };
         };
 
-        nodeImage = node.image;
+        nodeImage   = (mkNode { configNixPath = ./node.nix;   controlPlane = true;  }).image;
+        workerImage = (mkNode { configNixPath = ./worker.nix; controlPlane = false; }).image;
 
         debugScript = pkgs.writeTextFile {
           name = "u7s-debug";
@@ -884,8 +927,9 @@
       in {
         packages = {
           kubernetes  = kubernetes;
-          node-image  = nodeImage;
-          debug-image = debugImage;
+          node-image   = nodeImage;
+          worker-image = workerImage;
+          debug-image  = debugImage;
           default     = nodeImage;
         };
 
@@ -905,6 +949,11 @@
             curl
             pkgs.skopeo
             pkgs.dhall-nix
+            # cluster.sh reads cluster.dhall as JSON, and wires the nodes' network namespaces to the hub's bridge
+            pkgs.dhall-json
+            iproute2
+            pkgs.nftables
+            util-linux
           ];
           shellHook = ''
             echo "nix-usernetes dev shell"
