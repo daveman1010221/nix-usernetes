@@ -356,6 +356,19 @@
           # that starts: 24 pods at once are throttled ("pull QPS exceeded"), retried with a backoff, and take 18 s to run instead of 1.3 s.
           # This node pulls from a registry on its own host, so there is nothing to protect: 0 is no limit.
           registryPullQPS: 0
+          # The node's filesystem is the host's /home (the node's volumes), shared with everything else on it. The
+          # kubelet's defaults are shares of it (imagefs.available<15%, nodefs.available<10%, and image GC from 85%
+          # used): on a 500 GB /home, it evicted every pod (about 250, 2026-10-26) with 75 GB still free, for files that
+          # were not the cluster's. A node evicts when it is really short of space, a few GiB, and collects unused
+          # images only near that. Every signal is given: depending on the version, one left out keeps no default.
+          evictionHard:
+            memory.available: "100Mi"
+            nodefs.available: "5Gi"
+            imagefs.available: "5Gi"
+            nodefs.inodesFree: "5%"
+            imagefs.inodesFree: "5%"
+          imageGCHighThresholdPercent: 98
+          imageGCLowThresholdPercent: 95
           containerRuntimeEndpoint: "unix:///run/containerd/containerd.sock"
           staticPodPath: /etc/kubernetes/manifests
           clusterDNS:
