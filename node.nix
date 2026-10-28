@@ -197,6 +197,8 @@
           name = "prepare";
           required = true;
         })
+      (u:
+        u.NftRuleset "/etc/u7s/host-dns.nft")
     ];
     launch = u:
       u.System;

@@ -14,7 +14,12 @@ let p = Node.packages
 
 let s = Node.services
 
-in      Node.base "nix-usernetes-node" (p.common # p.pods # p.controlPlane) Node.boot.pods
+-- Its DNS goes to the host's resolver, which `just up` names (--dns 10.0.2.2), on the port it listens on for the node
+-- (flake.nix, hostDnsRules).
+let boot =
+      Node.boot.pods # [ Node.Lib.BootStep.NftRuleset "/etc/u7s/host-dns.nft" ]
+
+in      Node.base "nix-usernetes-node" (p.common # p.pods # p.controlPlane) boot
     //  { services =
           [ s.containerd
           , s.imagePreload

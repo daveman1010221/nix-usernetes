@@ -48,6 +48,7 @@ up:
         --name {{CONTAINER}} \
         --hostname {{NODE_NAME}} \
         --network slirp4netns:allow_host_loopback=true \
+        --dns 10.0.2.2 \
         --dns-search=. \
         --privileged \
         --pids-limit -1 \

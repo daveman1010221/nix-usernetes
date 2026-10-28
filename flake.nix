@@ -447,6 +447,28 @@
           }
         '';
 
+        # The single node's resolver is the host's (10.0.2.2, as slirp4netns presents it; `just up`'s --dns), on the
+        # port where it listens for the node, 5300, as CoreDNS's is: a resolv.conf names no port, so this table sends
+        # DNS for 10.0.2.2 there, from the node's own processes (output) and from pods with dnsPolicy Default
+        # (prerouting). Not the servers podman would list by default: slirp4netns's own 10.0.2.3 does not answer, and
+        # behind a VPN the host's other servers are blocked as leaks, while glibc tries only the first three, so with
+        # Mullvad connected the node resolved nothing (2026-10-26). A cluster's nodes reach the same resolver through
+        # the hub (cluster.sh).
+        hostDnsRules = pkgs.writeText "u7s-host-dns.nft" ''
+          table ip u7s-host-dns {
+            chain output {
+              type nat hook output priority dstnat; policy accept;
+              ip daddr 10.0.2.2 udp dport 53 dnat to 10.0.2.2:5300
+              ip daddr 10.0.2.2 tcp dport 53 dnat to 10.0.2.2:5300
+            }
+            chain prerouting {
+              type nat hook prerouting priority dstnat; policy accept;
+              ip daddr 10.0.2.2 udp dport 53 dnat to 10.0.2.2:5300
+              ip daddr 10.0.2.2 tcp dport 53 dnat to 10.0.2.2:5300
+            }
+          }
+        '';
+
         # A template: u7s-prepare writes it with the node's pod range at every start.
         cniConfig = pkgs.writeText "10-u7s.conflist.in" ''
           {
@@ -886,6 +908,9 @@
             mkdir -p etc/coredns
             cp ${coreDNSCorefile} etc/coredns/Corefile
             cp ${coreDNSManifest} etc/kubernetes/manifests/coredns.yaml
+
+            # its DNS, to the host's resolver (node.dhall's boot steps)
+            cp ${hostDnsRules} etc/u7s/host-dns.nft
           '' + pkgs.lib.optionalString (role == "control-plane") ''
 
             # ── CoreDNS, a Deployment on a worker ──────────────────────────────
