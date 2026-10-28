@@ -14,10 +14,6 @@
 #
 # CoreDNS is baked into the node image and starts automatically as a static
 # pod. No manual DNS setup is required after `just init`.
-#
-# cert-manager is a Polar concern, not cluster infrastructure. Install it
-# from the Polar project context:
-#   just install-cert-manager   # run from this directory before deploying Polar
 
 # ── configuration ─────────────────────────────────────────────────────────────
 
@@ -111,8 +107,6 @@ status:
 
 # Generate PKI, configs, and static pod manifests. Safe to re-run.
 # CoreDNS starts automatically via static pod — no manual DNS setup needed.
-# cert-manager is NOT installed here — it is a Polar concern.
-# Run `just install-cert-manager` separately before deploying Polar.
 init: _gen-pki _gen-configs _untaint _prepull-images
     @echo ""
     @echo "✓ Cluster initialised. Run 'just kubeconfig' then:"
@@ -120,7 +114,6 @@ init: _gen-pki _gen-configs _untaint _prepull-images
     @echo "  kubectl get pods -A"
     @echo ""
     @echo "CoreDNS will start automatically as a static pod."
-    @echo "Run 'just install-cert-manager' before deploying Polar."
 
 # Extract kubeconfig (replaces node name with 127.0.0.1 for local access).
 kubeconfig: _check-running
@@ -336,42 +329,6 @@ _prepull-images container=CONTAINER: (_check-running container)
         podman save "$img" | podman exec -i {{container}} ctr -n k8s.io images import -
     done
 
-# ── cert-manager (Polar concern) ──────────────────────────────────────────────
-
-# Install cert-manager into the cluster.
-# cert-manager is required by Polar but is not permanent cluster infrastructure.
-# Call this once after `just init` before deploying Polar.
-# Images are loaded from local podman cache — pull them first if not present:
-#   podman pull quay.io/jetstack/cert-manager-controller:v1.19.2
-#   podman pull quay.io/jetstack/cert-manager-cainjector:v1.19.2
-#   podman pull quay.io/jetstack/cert-manager-webhook:v1.19.2
-install-cert-manager: _check-running
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if podman exec {{CONTAINER}} kubectl --kubeconfig /etc/kubernetes/admin.conf \
-        get namespace cert-manager &>/dev/null; then
-        echo "cert-manager already installed, skipping."
-        exit 0
-    fi
-    for img in \
-        quay.io/jetstack/cert-manager-controller:v1.19.2 \
-        quay.io/jetstack/cert-manager-cainjector:v1.19.2 \
-        quay.io/jetstack/cert-manager-webhook:v1.19.2; do
-        if podman exec {{CONTAINER}} ctr -n k8s.io images check "$img" &>/dev/null; then
-            echo "Image $img already in cluster, skipping."
-            continue
-        fi
-        if ! podman image exists "$img" 2>/dev/null; then
-            echo "Pulling $img into local cache..."
-            podman pull "$img"
-        fi
-        echo "Loading $img into cluster..."
-        podman save "$img" | podman exec -i {{CONTAINER}} ctr -n k8s.io images import -
-    done
-    podman exec {{CONTAINER}} kubectl --kubeconfig /etc/kubernetes/admin.conf \
-        apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.19.2/cert-manager.yaml
-    echo "cert-manager installed."
-
 # ── pod debugging tools ───────────────────────────────────────────────────────
 
 _u7s_kubeconf := justfile_directory() + "/kubeconfig"
@@ -405,7 +362,7 @@ debug-shell: _check-running
     KUBECONFIG={{_u7s_kubeconf}} kubectl exec -it u7s-debug -- nu
 
 # Run debug script in a specific pod's netns.
-# Usage: just debug-pod cert-manager/cert-manager-7b8b89f89d-xxxxx
+# Usage: just debug-pod polar/cassini-xxxxx
 debug-pod pod: _check-running
     #!/usr/bin/env bash
     set -euo pipefail

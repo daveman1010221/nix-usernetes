@@ -962,7 +962,6 @@
             echo "  just load-node-image                          — load image into podman"
             echo "  just reset && just up && just init            — cycle the cluster"
             echo "  just kubeconfig                               — write kubeconfig"
-            echo "  just install-cert-manager                     — Polar prereq"
             echo ""
             echo "  nix build .#kubernetes    — build K8s binaries only"
             echo "  nix build .#debug-image   — build debug image"
