@@ -52,22 +52,17 @@ in  { -- the containers are <name>-<node> (and <name>-hub), the volumes <name>-<
     -- the host's port for the control plane's apiserver; u7s has 6443
     , apiserverPort = 7443
     , nodes =
-      [ -- Kubernetes' own: CoreDNS (a static pod) and what tolerates the control plane's taint
+      [ -- etcd and the control plane, and no kubelet: it is no Kubernetes node, so no pod runs there, and it takes no
+        -- labels or taints
         node "cp" Role.ControlPlane
-        // { taints =
-             [ { key = "node-role.kubernetes.io/control-plane"
-               , value = ""
-               , effect = Effect.NoSchedule
-               }
-             ]
-           }
       , -- Polar's core: the credentials agent, the cert issuer, cassini
         dedicatedPool "core"
       , -- the low-trust side: the observers
         dedicatedPool "observers"
       , -- the high-trust side: what writes the graph
         dedicatedPool "writers"
-      , -- the rest, which Polar relies on but is not Polar proper (Flux, the registry, Keycloak, ...)
+      , -- the rest, which Polar relies on but is not Polar proper (Flux, the registry, Keycloak, ...), and the
+        -- cluster's CoreDNS: a cluster needs a worker with no taint
         pool "services"
       ]
     }

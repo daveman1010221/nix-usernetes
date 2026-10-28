@@ -14,12 +14,16 @@
 #     the nodes again.
 #   - every node has a route to each other node's pod range through that node, so pods reach each other directly.
 #
+# The roles. The control plane (control-plane.dhall) runs etcd and the control plane, and no kubelet: it is no
+# Kubernetes node, and no pod runs on it. The workers (worker.dhall) run the pods, CoreDNS among them, on a worker with
+# no taint.
+#
 # Needs: podman, jq, dhall-to-json, and ip, nft, nsenter and unshare on the host (the dev shell has them all).
 set -euo pipefail
 cd "$(dirname "$0")"
 
 TOPOLOGY=${TOPOLOGY:-cluster.dhall}
-CP_IMAGE=${CP_IMAGE:-localhost/nix-usernetes-node:1.37.1}
+CP_IMAGE=${CP_IMAGE:-localhost/nix-usernetes-control-plane:1.37.1}
 WORKER_IMAGE=${WORKER_IMAGE:-localhost/nix-usernetes-worker:1.37.1}
 
 BRIDGE_NET=10.77.0      # the hub is .1, the nodes .11, .12, ... in cluster.dhall's order
@@ -37,6 +41,10 @@ mapfile -t WORKERS < <(jq -r '.nodes[] | select(.role == "Worker") | .name' <<<"
 [ "$(printf '%s\n' "${NODES[@]}" | sort -u | wc -l)" -eq "${#NODES[@]}" ] || { echo "$TOPOLOGY: node names repeat" >&2; exit 1; }
 [ "${#NODES[@]}" -le 200 ] || { echo "$TOPOLOGY: at most 200 nodes" >&2; exit 1; }
 CP=${CPS[0]}
+[ "$(jq --arg n "$CP" '.nodes[] | select(.name == $n) | (.labels | length) + (.taints | length)' <<<"$TOPO")" -eq 0 ] \
+    || { echo "$TOPOLOGY: the ControlPlane node ($CP) runs no kubelet, so it is no node to label or taint" >&2; exit 1; }
+[ "$(jq '[.nodes[] | select(.role == "Worker" and (.taints | length) == 0)] | length' <<<"$TOPO")" -gt 0 ] \
+    || echo "$TOPOLOGY: every worker is tainted, so CoreDNS, and every pod that tolerates no taint, has nowhere to run" >&2
 
 HUB=$CLUSTER-hub
 NETNS_DIR=$XDG_RUNTIME_DIR/nix-usernetes/$CLUSTER/netns
@@ -47,7 +55,7 @@ node_ip()  { echo "$BRIDGE_NET.$((11 + $(index_of "$1")))"; }
 pod_cidr() { echo "$POD_NET.$(index_of "$1").0/24"; }
 ctr()      { echo "$CLUSTER-$1"; }
 role()     { jq -r --arg n "$1" '.nodes[] | select(.name == $n) | .role' <<<"$TOPO"; }
-volumes()  { local v=(pki kubelet containerd local-path); [ "$(role "$1")" = ControlPlane ] && v+=(etcd); printf "$CLUSTER-$1-%s\n" "${v[@]}"; }
+volumes()  { local v=(pki etcd); [ "$(role "$1")" = Worker ] && v=(pki kubelet containerd local-path); printf "$CLUSTER-$1-%s\n" "${v[@]}"; }
 state()    { podman container inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo absent; }
 cp_kubectl() { podman exec "$(ctr "$CP")" kubectl --kubeconfig /etc/kubernetes/admin.conf "$@"; }
 
@@ -153,27 +161,35 @@ start_node() {
         esac
     done
     echo "Starting node $c ($(role "$n"), $(node_ip "$n"))."
-    # As `just up` runs u7s, but on the node's own network namespace, with the hub as its resolver.
+    # As `just up` runs u7s, but on the node's own network namespace, with the hub as its resolver. A worker runs pods,
+    # in cgroups and namespaces of its own, as u7s does; the control plane runs only etcd and the control plane, and
+    # needs no privilege for that.
+    local runs_pods=()
+    [ "$(role "$n")" = Worker ] && runs_pods=(
+        --privileged
+        --pids-limit -1
+        --cgroupns=private
+        --ipc=host
+        --security-opt seccomp=unconfined
+        --security-opt apparmor=unconfined
+        --volume /run/booted-system/kernel-modules/lib/modules:/lib/modules:ro
+    )
     podman run -d \
         --name "$c" \
         --hostname "$n" \
         --network "ns:$NETNS_DIR/$n" \
         --dns "$BRIDGE_NET.1" \
         --dns-search=. \
-        --privileged \
-        --pids-limit -1 \
-        --cgroupns=private \
-        --ipc=host \
-        --security-opt seccomp=unconfined \
-        --security-opt apparmor=unconfined \
+        "${runs_pods[@]}" \
         --tmpfs /run \
         --tmpfs /run/lock \
         --tmpfs /tmp \
-        --volume /run/booted-system/kernel-modules/lib/modules:/lib/modules:ro \
         "${vols[@]}" \
         --env NODE_NAME="$n" \
         --env NODE_IP="$(node_ip "$n")" \
         --env POD_CIDR="$(pod_cidr "$n")" \
+        --env NODE_LABELS="$(jq -r --arg n "$n" '.nodes[] | select(.name == $n) | .labels | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$TOPO")" \
+        --env NODE_TAINTS="$(jq -r --arg n "$n" '.nodes[] | select(.name == $n) | .taints | map("\(.key)=\(.value):\(.effect)") | join(",")' <<<"$TOPO")" \
         "$image" >/dev/null
 }
 
@@ -254,14 +270,13 @@ join_worker() {
     write_kubeconfig "$c" /etc/kubernetes/kubelet.conf "system:node:$w" "$dir" kubelet "$server"
 }
 
-# The node-role label kubectl shows, and cluster.dhall's labels and taints. A kubelet may not set node-role labels on
-# its own node (NodeRestriction), so all of them are set here.
+# The node-role label kubectl shows, and cluster.dhall's labels and taints, on every worker (the control plane is no
+# node). A worker registers with its labels and taints (NODE_LABELS, NODE_TAINTS); these are set again here, for a
+# worker created before they changed, and with the node-role label, which a kubelet may not set (NodeRestriction).
 apply_topology() {
-    local n r k v t
-    for n in "${NODES[@]}"; do
-        r=$(role "$n")
-        r=${r/ControlPlane/control-plane}; r=${r/Worker/worker}
-        cp_kubectl label node "$n" --overwrite "node-role.kubernetes.io/$r=" >/dev/null
+    local n k v t
+    for n in "${WORKERS[@]}"; do
+        cp_kubectl label node "$n" --overwrite "node-role.kubernetes.io/worker=" >/dev/null
         while IFS=$'\t' read -r k v; do
             [ -n "$k" ] && cp_kubectl label node "$n" --overwrite "$k=$v" >/dev/null
         done < <(jq -r --arg n "$n" '.nodes[] | select(.name == $n) | .labels | to_entries[] | [.key, .value] | @tsv' <<<"$TOPO")
@@ -274,7 +289,7 @@ apply_topology() {
 
 wait_for_nodes() {
     local n i
-    for n in "${NODES[@]}"; do
+    for n in "${WORKERS[@]}"; do
         for i in $(seq 1 60); do
             cp_kubectl get node "$n" >/dev/null 2>&1 && break
             [ "$i" -eq 60 ] && { echo "Node $n did not register. Check: just cluster-status, podman exec $(ctr "$n") vigil logs kubelet" >&2; exit 1; }
@@ -292,9 +307,13 @@ cmd_init() {
     just _gen-pki "$(ctr "$CP")" "$CP"
     just _gen-configs "$(ctr "$CP")" "$CP"
     for n in "${WORKERS[@]}"; do join_worker "$n"; done
-    for n in "${NODES[@]}"; do just _prepull-images "$(ctr "$n")"; done
+    for n in "${WORKERS[@]}"; do just _prepull-images "$(ctr "$n")"; done
     wait_for_nodes
     apply_topology
+    # Applied by the control plane's cluster-bootstrap, once the apiserver answers
+    until cp_kubectl -n kube-system get deployment coredns >/dev/null 2>&1; do sleep 2; done
+    cp_kubectl -n kube-system rollout status deployment coredns --timeout=180s \
+        || { echo "CoreDNS did not start. Check: kubectl -n kube-system describe pods -l k8s-app=kube-dns" >&2; exit 1; }
     echo ""
     echo "✓ Cluster '$CLUSTER' initialised. Run 'just cluster-kubeconfig', then:"
     echo "  export KUBECONFIG=$(pwd)/$KUBECONFIG_OUT"
@@ -321,12 +340,12 @@ cmd_down() {
     echo "Cluster '$CLUSTER' is down. Its state stays on its volumes."
 }
 
+# Every volume of the cluster's, also those of a node no longer in cluster.dhall, or of a role it no longer has.
 cmd_reset() {
     cmd_down
-    local n
-    for n in "${NODES[@]}"; do
-        # shellcheck disable=SC2046
-        podman volume rm -f $(volumes "$n") >/dev/null 2>&1 || true
+    local v
+    podman volume ls -q | grep -E "^$CLUSTER-.+-(pki|etcd|kubelet|containerd|local-path)\$" | while read -r v; do
+        podman volume rm -f "$v" >/dev/null
     done
     rm -f "$KUBECONFIG_OUT"
     echo "Cluster '$CLUSTER' wiped. Next: just cluster-up && just cluster-init"

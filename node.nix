@@ -26,29 +26,29 @@
       u.Micro)
     (u:
       u.Custom {
-        name = "node";
+        name = "nix-usernetes-node";
         packages = [
           { attrPath = "bash"; flakeInput = null; }
-          { attrPath = "conntrack-tools"; flakeInput = null; }
-          { attrPath = "containerd"; flakeInput = null; }
-          { attrPath = "cri-tools"; flakeInput = null; }
           { attrPath = "curl"; flakeInput = null; }
-          { attrPath = "etcd"; flakeInput = null; }
-          { attrPath = "ethtool"; flakeInput = null; }
           { attrPath = "findutils"; flakeInput = null; }
           { attrPath = "gnugrep"; flakeInput = null; }
           { attrPath = "gnused"; flakeInput = null; }
           { attrPath = "iproute2"; flakeInput = null; }
-          { attrPath = "iptables"; flakeInput = null; }
           { attrPath = "jq"; flakeInput = null; }
-          { attrPath = "kmod"; flakeInput = null; }
-          { attrPath = "kubernetes-helm"; flakeInput = null; }
-          { attrPath = "nftables"; flakeInput = null; }
           { attrPath = "openssl"; flakeInput = null; }
           { attrPath = "procps"; flakeInput = null; }
+          { attrPath = "util-linux"; flakeInput = null; }
+          { attrPath = "conntrack-tools"; flakeInput = null; }
+          { attrPath = "containerd"; flakeInput = null; }
+          { attrPath = "cri-tools"; flakeInput = null; }
+          { attrPath = "ethtool"; flakeInput = null; }
+          { attrPath = "iptables"; flakeInput = null; }
+          { attrPath = "kmod"; flakeInput = null; }
+          { attrPath = "nftables"; flakeInput = null; }
           { attrPath = "runc"; flakeInput = null; }
           { attrPath = "socat"; flakeInput = null; }
-          { attrPath = "util-linux"; flakeInput = null; }
+          { attrPath = "etcd"; flakeInput = null; }
+          { attrPath = "kubernetes-helm"; flakeInput = null; }
         ];
       })
   ];
@@ -178,7 +178,7 @@
         u.Restart;
       onSuccess = u:
         u.Ignore;
-      summary = "apply the kube-dns Service";
+      summary = "apply the cluster's own resources (kube-dns, and a cluster's CoreDNS)";
     }
   ];
   shell = null;

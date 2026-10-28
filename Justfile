@@ -377,20 +377,32 @@ debug-pod pod: _check-running
 load-node-image:
     podman load -i result-node-image
 
-# Load the worker image, for a cluster's workers, after `nix build .#worker-image -o result-worker-image`.
+# Load a cluster's control-plane image, after `nix build .#control-plane-image -o result-control-plane-image`.
+load-control-plane-image:
+    podman load -i result-control-plane-image
+
+# Load a cluster's worker image, after `nix build .#worker-image -o result-worker-image`.
 load-worker-image:
     podman load -i result-worker-image
 
-# Render node.dhall and worker.dhall (what a node runs: its packages, boot steps and services) to node.nix and
-# worker.nix, which nix build reads. Commit them all. Needs dhall-to-nix (nix shell nixpkgs#dhall-nix) and the
+# Build and load both of a cluster's images.
+build-cluster-images:
+    nix build .#control-plane-image -o result-control-plane-image
+    nix build .#worker-image -o result-worker-image
+    podman load -i result-control-plane-image
+    podman load -i result-worker-image
+
+# Render node.dhall, control-plane.dhall and worker.dhall (what each role runs: its packages, boot steps and services)
+# to .nix files, which nix build reads. Commit them all. Needs dhall-to-nix (nix shell nixpkgs#dhall-nix) and the
 # network, for the library's prelude.
 render:
     dhall-to-nix < node.dhall > node.nix
+    dhall-to-nix < control-plane.dhall > control-plane.nix
     dhall-to-nix < worker.dhall > worker.nix
 
 # ── a cluster of nodes (cluster.dhall, cluster.sh) ───────────────────────────────────────────────────────────────────
 # One control plane and workers, each its own container, on a network of their own; u7s above is separate, and the two
-# can run side by side. The images: node-image (the control plane) and worker-image, built and loaded as above.
+# can run side by side. The images: control-plane-image and worker-image (build-cluster-images).
 
 # Start the cluster: the hub, the nodes' network, the nodes. Idempotent, as `up` is.
 cluster-up:

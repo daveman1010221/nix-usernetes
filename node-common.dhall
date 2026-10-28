@@ -1,7 +1,10 @@
 -- node-common.dhall
 --
--- What every node has, whatever its role: its packages, what it does once at each start, and the services it may run.
--- node.dhall (the control plane, and the single node of `just up`) and worker.dhall each pick their services from here.
+-- What nodes are made of, whatever their role: packages, what a node does once at each start, and the services it may
+-- run. Each role picks from here:
+--   node.dhall           — the single node of `just up` (u7s): everything
+--   control-plane.dhall  — a cluster's control plane: etcd and the control plane, and no kubelet, so no pod runs there
+--   worker.dhall         — a cluster's worker: containerd, the kubelet and kube-proxy
 --
 -- What lives where:
 --   here       — what a node runs: its packages, what it does once at each start, its services and their order
@@ -23,54 +26,73 @@ let oneShot = { onSuccess = Lib.ServiceExit.Ignore, onFailure = Lib.ServiceExit.
 
 -- The CNI plugins are not here: they are linked into /opt/cni/bin (flake.nix), and one of them, bridge, is also
 -- iproute2's.
-let nodePackages =
-      Lib.customLayer
-        "node"
+let packages =
+      { -- every node's
+        common =
         [ Lib.nixpkgs "bash"
-        , Lib.nixpkgs "conntrack-tools"
-        , Lib.nixpkgs "containerd"
-        , Lib.nixpkgs "cri-tools"
         , Lib.nixpkgs "curl"
-        , Lib.nixpkgs "etcd"
-        , Lib.nixpkgs "ethtool"
         , Lib.nixpkgs "findutils"
         , Lib.nixpkgs "gnugrep"
         , Lib.nixpkgs "gnused"
         , Lib.nixpkgs "iproute2"
-        , Lib.nixpkgs "iptables"
         , Lib.nixpkgs "jq"
-        , Lib.nixpkgs "kmod"
-        , Lib.nixpkgs "kubernetes-helm"
-        , Lib.nixpkgs "nftables"
         , Lib.nixpkgs "openssl"
         , Lib.nixpkgs "procps"
-        , Lib.nixpkgs "runc"
-        , Lib.nixpkgs "socat"
         , Lib.nixpkgs "util-linux"
         ]
+      , -- a node that runs pods
+        pods =
+        [ Lib.nixpkgs "conntrack-tools"
+        , Lib.nixpkgs "containerd"
+        , Lib.nixpkgs "cri-tools"
+        , Lib.nixpkgs "ethtool"
+        , Lib.nixpkgs "iptables"
+        , Lib.nixpkgs "kmod"
+        , Lib.nixpkgs "nftables"
+        , Lib.nixpkgs "runc"
+        , Lib.nixpkgs "socat"
+        ]
+      , -- a node that runs the control plane
+        controlPlane = [ Lib.nixpkgs "etcd", Lib.nixpkgs "kubernetes-helm" ]
+      }
 
--- A node without its services (and its name): each role adds the ones it runs.
+let boot =
+      { -- A node that runs pods: containerd puts every pod's cgroup under the root of the node's own cgroup namespace
+        -- (/k8s.io/<id>), and pods are masqueraded by a table, not by CNI's ipMasq, whose nftables backend needs the
+        -- `inet` family.
+        pods =
+        [ Lib.BootStep.DelegateCgroups
+        , Lib.BootStep.Sysctls "/etc/sysctl.d/99-u7s.conf"
+        , Lib.BootStep.NftRuleset "/etc/u7s/masquerade.nft"
+        , Lib.BootStep.Script
+            { name = "prepare", command = "/bin/u7s-prepare", required = True }
+        ]
+      , -- The control plane alone: its name, which its kubeconfigs use, resolves to itself.
+        controlPlane =
+        [ Lib.BootStep.Script
+            { name = "prepare", command = "/bin/u7s-prepare", required = True }
+        ]
+      }
+
+-- A node of the given name, packages and boot steps, without its services: each role adds the ones it runs.
 let base =
-          Lib.defaults.systemContainer
-      //  { packageLayers = [ Lib.PackageLayer.Micro, nodePackages ]
-          , extraEnv =
-            [ Lib.buildEnv "KUBECONFIG" "/etc/kubernetes/admin.conf"
-            , Lib.buildEnv "VIGIL_LOG_BUFFER" "5000"
-            ]
-          , startup = Some
-              { session = Lib.Session.None
-              , boot =
-                -- containerd puts every pod's cgroup under the root of the node's own cgroup namespace (/k8s.io/<id>).
-                [ Lib.BootStep.DelegateCgroups
-                , Lib.BootStep.Sysctls "/etc/sysctl.d/99-u7s.conf"
-                -- Pods are masqueraded by this table, not by CNI's ipMasq, whose nftables backend needs the `inet` family.
-                , Lib.BootStep.NftRuleset "/etc/u7s/masquerade.nft"
-                , Lib.BootStep.Script
-                    { name = "prepare", command = "/bin/u7s-prepare", required = True }
-                ]
-              , launch = Lib.Launch.System
-              }
-          }
+      \(name : Text) ->
+      \(nodePackages : List Lib.PackageRef) ->
+      \(bootSteps : List Lib.BootStep) ->
+            Lib.defaults.systemContainer
+        //  { name
+            , packageLayers =
+              [ Lib.PackageLayer.Micro, Lib.customLayer name nodePackages ]
+            , extraEnv =
+              [ Lib.buildEnv "KUBECONFIG" "/etc/kubernetes/admin.conf"
+              , Lib.buildEnv "VIGIL_LOG_BUFFER" "5000"
+              ]
+            , startup = Some
+                { session = Lib.Session.None
+                , boot = bootSteps
+                , launch = Lib.Launch.System
+                }
+            }
 
 -- A service starts once those it is `after` are running, not once they are done: what one needs before it can start
 -- (its certificates, its kubeconfig, the preloaded images), its script waits for. Ordering only, as systemd's Wants=
@@ -85,7 +107,7 @@ let services =
       , kubelet = service // quiet // { name = "kubelet", summary = "kubelet", command = "/bin/u7s-kubelet", after = [ "containerd", "image-preload" ], killDelay = Some "20s" }
       -- After the apiserver where the node runs one (node.dhall); on a worker, its script waits for its kubeconfig.
       , kubeProxy = service // quiet // { name = "kube-proxy", summary = "kube-proxy", command = "/bin/u7s-kube-proxy" }
-      , clusterBootstrap = service // quiet // oneShot // { name = "cluster-bootstrap", summary = "apply the kube-dns Service", command = "/bin/u7s-cluster-bootstrap", after = [ "kube-apiserver" ] }
+      , clusterBootstrap = service // quiet // oneShot // { name = "cluster-bootstrap", summary = "apply the cluster's own resources (kube-dns, and a cluster's CoreDNS)", command = "/bin/u7s-cluster-bootstrap", after = [ "kube-apiserver" ] }
       }
 
-in  { Lib, base, services }
+in  { Lib, packages, boot, base, services }

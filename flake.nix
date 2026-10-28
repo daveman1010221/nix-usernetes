@@ -85,9 +85,12 @@
         };
 
         # ── kubelet (+ friends) built from source ─────────────────────────────
+        # One build, one output per binary, so that each image carries only the binaries its role runs: `out` is
+        # kubectl, the others kubernetes.kubelet, kubernetes.proxy, kubernetes.apiserver, ...
         kubernetes = pkgs.stdenv.mkDerivation rec {
           pname   = "kubernetes";
           version = k8sVersion;
+          outputs = [ "out" "kubelet" "proxy" "apiserver" "controllerManager" "scheduler" ];
 
           src = kubernetesSrc;
 
@@ -171,8 +174,12 @@
 
           installPhase = ''
             runHook preInstall
-            mkdir -p "$out/bin"
-            cp _output/bin/* "$out/bin/"
+            install -Dm755 _output/bin/kubectl                 "$out/bin/kubectl"
+            install -Dm755 _output/bin/kubelet                 "$kubelet/bin/kubelet"
+            install -Dm755 _output/bin/kube-proxy              "$proxy/bin/kube-proxy"
+            install -Dm755 _output/bin/kube-apiserver          "$apiserver/bin/kube-apiserver"
+            install -Dm755 _output/bin/kube-controller-manager "$controllerManager/bin/kube-controller-manager"
+            install -Dm755 _output/bin/kube-scheduler          "$scheduler/bin/kube-scheduler"
             runHook postInstall
           '';
 
@@ -231,18 +238,21 @@
         '';
 
         # The apiserver advertises the node's address, so a node that is removed and created again (`just restart`, or
-        # by hand) starts as it did.
+        # by hand) starts as it did. It reaches an aggregated API's or a webhook's Service at the address of a pod behind
+        # it, not at its cluster IP (--enable-aggregator-routing): a cluster's control plane runs no kube-proxy, so no
+        # cluster IP answers there, while every pod's address does (cluster.sh routes the pod ranges).
         apiserverRun = pkgs.writeShellScriptBin "u7s-kube-apiserver" ''
           export PATH=${servicePath}
           ${waitFor "/etc/kubernetes/pki/apiserver.crt"}
           ${nodeIp}
-          exec ${kubernetes}/bin/kube-apiserver \
+          exec ${kubernetes.apiserver}/bin/kube-apiserver \
             --advertise-address="$NODE_IP" \
             --bind-address=0.0.0.0 \
             --allow-privileged=true \
             --authorization-mode=Node,RBAC \
             --client-ca-file=/etc/kubernetes/pki/ca.crt \
             --enable-admission-plugins=NodeRestriction \
+            --enable-aggregator-routing=true \
             --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt \
             --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt \
             --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key \
@@ -271,7 +281,7 @@
           ${waitFor "/etc/kubernetes/controller-manager.conf"}
           # Each node's pod range is given to it (POD_CIDR, read by u7s-prepare into CNI's host-local IPAM), so none is
           # allocated here: one allocated in the order nodes register would not be the range the node uses.
-          exec ${kubernetes}/bin/kube-controller-manager \
+          exec ${kubernetes.controllerManager}/bin/kube-controller-manager \
             --allocate-node-cidrs=false \
             --cluster-cidr=${clusterCidr} \
             --cluster-name=kubernetes \
@@ -289,33 +299,38 @@
         schedulerRun = pkgs.writeShellScriptBin "u7s-kube-scheduler" ''
           export PATH=${servicePath}
           ${waitFor "/etc/kubernetes/scheduler.conf"}
-          exec ${kubernetes}/bin/kube-scheduler \
+          exec ${kubernetes.scheduler}/bin/kube-scheduler \
             --kubeconfig=/etc/kubernetes/scheduler.conf \
             --leader-elect=false
         '';
 
         # The kubelet waits for image-preload to have imported CoreDNS into containerd, before it reads the static pod
-        # manifest directory.
+        # manifest directory. A cluster's worker registers with its labels and taints (NODE_LABELS, NODE_TAINTS, from
+        # cluster.dhall), so it is never Ready without them, and nothing is scheduled there that they would keep out.
         kubeletRun = pkgs.writeShellScriptBin "u7s-kubelet" ''
-          export PATH=${servicePath}:${kubernetes}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin
+          export PATH=${servicePath}:${kubernetes.kubelet}/bin:${containerd}/bin:${runc}/bin:${cri-tools}/bin
           ${waitFor "/etc/kubernetes/kubelet.conf"}
           ${waitFor "/run/u7s/images-preloaded"}
           ${nodeIp}
-          exec ${kubernetes}/bin/kubelet \
+          set --
+          [ -n "''${NODE_LABELS:-}" ] && set -- "$@" --node-labels="$NODE_LABELS"
+          [ -n "''${NODE_TAINTS:-}" ] && set -- "$@" --register-with-taints="$NODE_TAINTS"
+          exec ${kubernetes.kubelet}/bin/kubelet \
             --config=/etc/kubelet/kubelet-config.yaml \
             --kubeconfig=/etc/kubernetes/kubelet.conf \
             --node-ip="$NODE_IP" \
-            --v=2
+            --v=2 \
+            "$@"
         '';
 
         # A worker has its own kubeconfig (kube-proxy.conf, written by `just cluster-init`); the control plane uses the
         # admin's, as the single node always has.
         kubeProxyRun = pkgs.writeShellScriptBin "u7s-kube-proxy" ''
-          export PATH=${servicePath}:${kubernetes}/bin:${pkgs.nftables}/bin
+          export PATH=${servicePath}:${kubernetes.proxy}/bin:${pkgs.nftables}/bin
           until [ -e /etc/kubernetes/kube-proxy.conf ] || [ -e /etc/kubernetes/admin.conf ]; do sleep 2; done
           config=/etc/kubernetes/admin.conf
           [ -e /etc/kubernetes/kube-proxy.conf ] && config=/etc/kubernetes/kube-proxy.conf
-          exec ${kubernetes}/bin/kube-proxy \
+          exec ${kubernetes.proxy}/bin/kube-proxy \
             --kubeconfig="$config" \
             --proxy-mode=nftables \
             --cluster-cidr=${clusterCidr} \
@@ -464,7 +479,8 @@
         '';
 
         # ── CoreDNS Corefile ──────────────────────────────────────────────────
-        # Mounted as a hostPath volume by the CoreDNS static pod.
+        # The single node's is mounted as a hostPath volume by the CoreDNS static pod, which reaches the apiserver with
+        # a kubeconfig; a cluster's is in a ConfigMap, for a Deployment that reaches it as its service account.
         # Forwards upstream DNS to 10.0.2.2:5300: 10.0.2.2 is the host, as
         # slirp4netns presents it (its gateway), so this is the host's
         # 127.0.0.1:5300, a second listener of systemd-resolved
@@ -477,7 +493,7 @@
         # inside the node (no reply to a query sent from the node container,
         # while the host's resolvers answered), so nothing resolved names
         # outside the cluster.
-        coreDNSCorefile = pkgs.writeText "Corefile" ''
+        coreDNSCorefileText = kubernetesAccess: ''
           .:53 {
               errors
               health {
@@ -488,7 +504,7 @@
                   pods insecure
                   fallthrough in-addr.arpa ip6.arpa
                   ttl 30
-                  kubeconfig /etc/kubernetes/coredns.conf kubernetes-admin@kubernetes
+                  ${kubernetesAccess}
               }
               forward . 10.0.2.2:5300
               cache 30
@@ -497,6 +513,8 @@
               loadbalance
           }
         '';
+        coreDNSCorefile = pkgs.writeText "Corefile"
+          (coreDNSCorefileText "kubeconfig /etc/kubernetes/coredns.conf kubernetes-admin@kubernetes");
 
         # ── CoreDNS static pod manifest ───────────────────────────────────────
         # kubelet watches /etc/kubernetes/manifests/ and manages this pod
@@ -575,6 +593,87 @@
             dnsPolicy: Default
         '';
 
+        # ── a cluster's CoreDNS ───────────────────────────────────────────────
+        # A cluster's control plane runs no kubelet, so its CoreDNS is a Deployment, which its cluster-bootstrap
+        # applies, on a worker: on one with no taint (it tolerates none of a pool's, cluster.dhall), from the image
+        # every worker carries (imagePullPolicy: Never). It reaches the apiserver as its service account, with the
+        # permissions of upstream's system:coredns, and the host's resolver as the single node's does (10.0.2.2:5300,
+        # through the hub). As JSON: the Corefile in its ConfigMap is a string, with no indentation to keep.
+        coreDNSClusterManifest = pkgs.writeText "coredns.json" (builtins.toJSON {
+          apiVersion = "v1";
+          kind = "List";
+          items = [
+            {
+              apiVersion = "v1";
+              kind = "ServiceAccount";
+              metadata = { name = "coredns"; namespace = "kube-system"; };
+            }
+            {
+              apiVersion = "rbac.authorization.k8s.io/v1";
+              kind = "ClusterRole";
+              metadata.name = "system:coredns";
+              rules = [
+                { apiGroups = [ "" ]; resources = [ "endpoints" "services" "pods" "namespaces" ]; verbs = [ "list" "watch" ]; }
+                { apiGroups = [ "discovery.k8s.io" ]; resources = [ "endpointslices" ]; verbs = [ "list" "watch" ]; }
+              ];
+            }
+            {
+              apiVersion = "rbac.authorization.k8s.io/v1";
+              kind = "ClusterRoleBinding";
+              metadata.name = "system:coredns";
+              roleRef = { apiGroup = "rbac.authorization.k8s.io"; kind = "ClusterRole"; name = "system:coredns"; };
+              subjects = [ { kind = "ServiceAccount"; name = "coredns"; namespace = "kube-system"; } ];
+            }
+            {
+              apiVersion = "v1";
+              kind = "ConfigMap";
+              metadata = { name = "coredns"; namespace = "kube-system"; };
+              data.Corefile = coreDNSCorefileText "";
+            }
+            {
+              apiVersion = "apps/v1";
+              kind = "Deployment";
+              metadata = { name = "coredns"; namespace = "kube-system"; labels.k8s-app = "kube-dns"; };
+              spec = {
+                replicas = 1;
+                selector.matchLabels.k8s-app = "kube-dns";
+                template = {
+                  metadata.labels.k8s-app = "kube-dns";
+                  spec = {
+                    serviceAccountName = "coredns";
+                    priorityClassName = "system-cluster-critical";
+                    tolerations = [ { key = "CriticalAddonsOnly"; operator = "Exists"; } ];
+                    dnsPolicy = "Default";
+                    containers = [ {
+                      name = "coredns";
+                      image = "registry.k8s.io/coredns/coredns:v${coreDNSVersion}";
+                      imagePullPolicy = "Never";
+                      args = [ "-conf" "/etc/coredns/Corefile" ];
+                      volumeMounts = [ { name = "config-volume"; mountPath = "/etc/coredns"; readOnly = true; } ];
+                      ports = [
+                        { containerPort = 53; name = "dns"; protocol = "UDP"; }
+                        { containerPort = 53; name = "dns-tcp"; protocol = "TCP"; }
+                        { containerPort = 9153; name = "metrics"; protocol = "TCP"; }
+                      ];
+                      livenessProbe = {
+                        httpGet = { path = "/health"; port = 8080; scheme = "HTTP"; };
+                        initialDelaySeconds = 60; timeoutSeconds = 5; successThreshold = 1; failureThreshold = 5;
+                      };
+                      readinessProbe.httpGet = { path = "/ready"; port = 8181; scheme = "HTTP"; };
+                      securityContext = {
+                        allowPrivilegeEscalation = false;
+                        capabilities = { add = [ "NET_BIND_SERVICE" ]; drop = [ "ALL" ]; };
+                        readOnlyRootFilesystem = true;
+                      };
+                    } ];
+                    volumes = [ { name = "config-volume"; configMap.name = "coredns"; } ];
+                  };
+                };
+              };
+            }
+          ];
+        });
+
         # ── kube-dns Service manifest ─────────────────────────────────────────
         # Applied by the cluster-bootstrap service after the apiserver is ready.
         # Gives CoreDNS its well-known cluster IP (10.96.0.10) so that
@@ -645,32 +744,34 @@
 
         # ── cluster bootstrap ─────────────────────────────────────────────────
         # A one-shot service: it waits for /etc/kubernetes/admin.conf (written by just init's _gen-configs step) and a
-        # live apiserver, then applies the kube-dns Service. It runs at every start; kubectl apply is idempotent.
+        # live apiserver, then applies what the image carries in /var/lib/cluster-bootstrap: the kube-dns Service, and a
+        # cluster's control plane also its CoreDNS. It runs at every start; kubectl apply is idempotent.
         clusterBootstrapRun = pkgs.writeShellScriptBin "u7s-cluster-bootstrap" ''
           export PATH=${servicePath}:${kubernetes}/bin
           ${waitFor "/etc/kubernetes/admin.conf"}
-          until kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes >/dev/null 2>&1; do
+          until kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw /readyz >/dev/null 2>&1; do
             echo "cluster-bootstrap: waiting for apiserver..."
             sleep 3
           done
-          exec kubectl --kubeconfig /etc/kubernetes/admin.conf \
-            apply -f /var/lib/cluster-bootstrap/kube-dns-service.yaml
+          exec kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f /var/lib/cluster-bootstrap/
         '';
 
         # ── boot step: prepare ────────────────────────────────────────────────
         # node-common.dhall's boot steps run once, at each start, before vigild: the cgroup delegation, the sysctls and
         # the pod masquerade come from nix-container-lib; this does the rest. podman writes /etc/hosts at every start,
         # and the node's name resolves to itself (the control plane's kubeconfigs use it). The files that hold the
-        # node's address and pod range are written from their templates. /run (a tmpfs) holds what the services hand
-        # each other.
+        # node's address and pod range are written from their templates, on a node that runs pods (a cluster's control
+        # plane has neither). /run (a tmpfs) holds what the services hand each other.
         nodePrepare = pkgs.writeShellScriptBin "u7s-prepare" ''
           export PATH=${servicePath}
           set -eu
           name=''${NODE_NAME:-u7s-node}
           grep -qw "$name" /etc/hosts || echo "127.0.0.1 $name" >> /etc/hosts
           ${nodeIp}
-          sed "s|@POD_CIDR@|''${POD_CIDR:-10.244.0.0/24}|" /etc/u7s/10-u7s.conflist.in > /etc/cni/net.d/10-u7s.conflist
-          sed "s|@NODE_IP@|$NODE_IP|" /etc/u7s/registry-hosts.toml.in > /etc/containerd/certs.d/localhost:30500/hosts.toml
+          if [ -e /etc/u7s/10-u7s.conflist.in ]; then
+            sed "s|@POD_CIDR@|''${POD_CIDR:-10.244.0.0/24}|" /etc/u7s/10-u7s.conflist.in > /etc/cni/net.d/10-u7s.conflist
+            sed "s|@NODE_IP@|$NODE_IP|" /etc/u7s/registry-hosts.toml.in > /etc/containerd/certs.d/localhost:30500/hosts.toml
+          fi
           mkdir -p /run/u7s
         '';
 
@@ -681,48 +782,60 @@
           echo "$NODE_IP"
         '';
 
-        nodeScripts = pkgs.symlinkJoin {
-          name  = "u7s-node-scripts";
-          paths = [
-            nodeIpRun
-            nodePrepare
-            containerdRun
-            imagePreloadRun
-            etcdRun
-            apiserverRun
-            controllerManagerRun
-            schedulerRun
-            kubeletRun
-            kubeProxyRun
-            clusterBootstrapRun
-          ];
-        };
+        # Each role's scripts: a node that runs pods, one that runs the control plane, the single node both.
+        commonScripts       = [ nodeIpRun nodePrepare ];
+        podScripts          = [ containerdRun imagePreloadRun kubeletRun kubeProxyRun ];
+        controlPlaneScripts = [ etcdRun apiserverRun controllerManagerRun schedulerRun clusterBootstrapRun ];
 
         # ── OCI images ────────────────────────────────────────────────────────
-        # nix-container-lib System containers, from node.dhall and worker.dhall (rendered to node.nix and worker.nix).
-        # The library makes start.nu, which runs the boot steps, writes vigild's layer from the services, and execs
-        # vigild as PID 1; this adds what a node is made of. A worker carries the same files but no static pods and no
-        # cluster bootstrap: CoreDNS and the kube-dns Service are the control plane's.
-        mkNode = { configNixPath, controlPlane }: nix-container-lib.lib.${system}.mkContainer {
+        # nix-container-lib System containers, one per role, from node.dhall, control-plane.dhall and worker.dhall
+        # (rendered to .nix). The library makes start.nu, which runs the boot steps, writes vigild's layer from the
+        # services, and execs vigild as PID 1; this adds what a node is made of:
+        #   single        — u7s: the control plane and the pods, CoreDNS as a static pod
+        #   control-plane — a cluster's: etcd and the control plane, CoreDNS as a Deployment it applies; no kubelet
+        #   worker        — a cluster's: containerd, the kubelet and kube-proxy, and the CoreDNS image
+        mkNode = { configNixPath, role }:
+          let
+            runsPods         = role != "control-plane";
+            runsControlPlane = role != "worker";
+            description = {
+              single          = "Rootless Kubernetes for developer workstations: a single node";
+              "control-plane" = "Rootless Kubernetes for developer workstations: a cluster's control plane";
+              worker          = "Rootless Kubernetes for developer workstations: a cluster's worker node";
+            }.${role};
+          in nix-container-lib.lib.${system}.mkContainer {
           inherit system pkgs configNixPath;
           inputs        = { inherit vigil-rs; };
           tag           = k8sVersion;
 
-          extraDerivations = [
-            kubernetes
-            nodeScripts
-            # `vigil services list`, `vigil logs` (just status, just logs)
-            vigil-rs.packages.${system}.vigil
-            # GNU coreutils over the library's (a subset: no seq, cut, wc, head, du, ...), which the scripts and
-            # `just init` use. start.nu keeps the library's: it puts them first on its own PATH.
-            (pkgs.lib.hiPrio coreutils)
-          ];
+          extraDerivations =
+            [ (pkgs.symlinkJoin {
+                name  = "u7s-${role}-scripts";
+                paths = commonScripts
+                  ++ pkgs.lib.optionals runsPods podScripts
+                  ++ pkgs.lib.optionals runsControlPlane controlPlaneScripts;
+              })
+              # `vigil services list`, `vigil logs` (just status, just logs)
+              vigil-rs.packages.${system}.vigil
+              # GNU coreutils over the library's (a subset: no seq, cut, wc, head, du, ...), which the scripts and
+              # `just init` use. start.nu keeps the library's: it puts them first on its own PATH.
+              (pkgs.lib.hiPrio coreutils)
+            ]
+            # The role's own binaries, on PATH as well as in its scripts
+            ++ pkgs.lib.optionals runsPods [ kubernetes.kubelet kubernetes.proxy ]
+            ++ pkgs.lib.optionals runsControlPlane [
+              kubernetes.out kubernetes.apiserver kubernetes.controllerManager kubernetes.scheduler
+            ];
 
           # Files the node carries as files: a volume mounted over one of these directories (u7s-pki over
           # /etc/kubernetes) is filled from the image when it is created, and keeps what it was filled with.
           extraCommands = ''
             # tools that look in /sbin find them in /bin (every package here has its sbin tools in bin too)
             [ -e sbin ] || ln -s bin sbin
+
+            # /etc/kubernetes is populated at runtime by just init
+            mkdir -p etc/kubernetes/pki
+          '' + pkgs.lib.optionalString runsPods ''
 
             # containerd config
             mkdir -p etc/containerd
@@ -752,33 +865,32 @@
             # volume mount doesn't shadow it
             mkdir -p etc/kubelet
             cp ${kubeletConfig} etc/kubelet/kubelet-config.yaml
+            mkdir -p etc/kubernetes/manifests
 
-            # /etc/kubernetes is populated at runtime by just init
-            mkdir -p etc/kubernetes/manifests etc/kubernetes/pki
-          '' + pkgs.lib.optionalString controlPlane ''
-
-            # ── CoreDNS ────────────────────────────────────────────────────────
-            # Corefile — mounted as hostPath by the CoreDNS static pod
-            mkdir -p etc/coredns
-            cp ${coreDNSCorefile} etc/coredns/Corefile
-
-            # Static pod manifest — kubelet manages CoreDNS automatically
-            cp ${coreDNSManifest} etc/kubernetes/manifests/coredns.yaml
-
-            # The CoreDNS image, imported by the image-preload service
+            # The CoreDNS image, imported by the image-preload service: the single node's static pod runs it, and a
+            # cluster's Deployment on whichever worker it is scheduled
             mkdir -p var/lib/preload-images
             cp ${coreDNSImage} var/lib/preload-images/coredns.tar
 
+            mkdir -p var/lib/kubelet run/containerd run/kubernetes lib/modules
+          '' + pkgs.lib.optionalString runsControlPlane ''
+
             # ── Cluster bootstrap resources ────────────────────────────────────
             # Applied by the cluster-bootstrap service after apiserver is ready.
-            mkdir -p var/lib/cluster-bootstrap
+            mkdir -p var/lib/cluster-bootstrap var/lib/etcd
             cp ${kubeDNSServiceManifest} var/lib/cluster-bootstrap/kube-dns-service.yaml
-          '' + ''
+          '' + pkgs.lib.optionalString (role == "single") ''
 
-            # Standard dirs
-            mkdir -p var/lib/kubelet var/lib/etcd
-            mkdir -p run/containerd run/kubernetes
-            mkdir -p lib/modules
+            # ── CoreDNS, a static pod ──────────────────────────────────────────
+            # Corefile — mounted as hostPath by the CoreDNS static pod
+            mkdir -p etc/coredns
+            cp ${coreDNSCorefile} etc/coredns/Corefile
+            cp ${coreDNSManifest} etc/kubernetes/manifests/coredns.yaml
+          '' + pkgs.lib.optionalString (role == "control-plane") ''
+
+            # ── CoreDNS, a Deployment on a worker ──────────────────────────────
+            cp ${coreDNSClusterManifest} var/lib/cluster-bootstrap/coredns.json
+          '' + ''
 
             touch etc/resolv.conf
             echo "u7s-node" > etc/hostname
@@ -790,24 +902,23 @@
             # `podman run` and left behind by `podman rm`.
             Volumes = {
               "/etc/kubernetes"       = {};
+            } // pkgs.lib.optionalAttrs runsPods {
               "/var/lib/kubelet"      = {};
               "/var/lib/containerd"   = {};
               "/opt/local-path-provisioner" = {};
-            } // pkgs.lib.optionalAttrs controlPlane {
+            } // pkgs.lib.optionalAttrs runsControlPlane {
               "/var/lib/etcd"         = {};
             };
             Labels = {
-              "org.opencontainers.image.description" =
-                if controlPlane
-                then "Rootless Kubernetes for developer workstations: a single node, or a cluster's control plane"
-                else "Rootless Kubernetes for developer workstations: a cluster's worker node";
+              "org.opencontainers.image.description" = description;
               "org.opencontainers.image.version"     = k8sVersion;
             };
           };
         };
 
-        nodeImage   = (mkNode { configNixPath = ./node.nix;   controlPlane = true;  }).image;
-        workerImage = (mkNode { configNixPath = ./worker.nix; controlPlane = false; }).image;
+        nodeImage         = (mkNode { configNixPath = ./node.nix;          role = "single";        }).image;
+        controlPlaneImage = (mkNode { configNixPath = ./control-plane.nix; role = "control-plane"; }).image;
+        workerImage       = (mkNode { configNixPath = ./worker.nix;        role = "worker";        }).image;
 
         debugScript = pkgs.writeTextFile {
           name = "u7s-debug";
@@ -927,8 +1038,9 @@
       in {
         packages = {
           kubernetes  = kubernetes;
-          node-image   = nodeImage;
-          worker-image = workerImage;
+          node-image          = nodeImage;
+          control-plane-image = controlPlaneImage;
+          worker-image        = workerImage;
           debug-image  = debugImage;
           default     = nodeImage;
         };
@@ -958,8 +1070,9 @@
           shellHook = ''
             echo "nix-usernetes dev shell"
             echo ""
-            echo "  nix build .#node-image -o result-node-image   — build node image"
+            echo "  nix build .#node-image -o result-node-image   — build the single node's image"
             echo "  just load-node-image                          — load image into podman"
+            echo "  just build-cluster-images                     — build and load a cluster's (control plane, worker)"
             echo "  just reset && just up && just init            — cycle the cluster"
             echo "  just kubeconfig                               — write kubeconfig"
             echo ""

@@ -87,8 +87,7 @@ container, with labels and taints per node. It runs beside the single node (u7s)
 on its own apiserver port (7443).
 
 ```bash
-nix build .#node-image -o result-node-image && just load-node-image       # the control plane
-nix build .#worker-image -o result-worker-image && just load-worker-image # the workers
+just build-cluster-images  # the control plane's image and the workers'
 nix develop        # cluster.sh needs dhall-to-json, ip, nft, nsenter and unshare
 just cluster-up    # the hub, the nodes' network, the nodes
 just cluster-init  # once: the control plane's PKI, the workers joined, labels and taints
@@ -105,11 +104,11 @@ end of `cluster.dhall`'s list and run `just cluster-up` and `just cluster-init` 
 
 | Node | Runs | Label | Taint |
 |------|------|-------|-------|
-| `cp` | Kubernetes' own (CoreDNS) | | `node-role.kubernetes.io/control-plane:NoSchedule` |
+| `cp` | etcd and the control plane; no kubelet, so it is no node, and no pod runs there | | |
 | `core` | Polar's core: the credentials agent, the cert issuer, cassini | `polar.dev/pool=core` | `polar.dev/pool=core:NoSchedule` |
 | `observers` | the low-trust side: the observers | `polar.dev/pool=observers` | `polar.dev/pool=observers:NoSchedule` |
 | `writers` | the high-trust side: what writes the graph | `polar.dev/pool=writers` | `polar.dev/pool=writers:NoSchedule` |
-| `services` | everything else Polar relies on (Flux, the registry, Keycloak, ...) | `polar.dev/pool=services` | |
+| `services` | everything else Polar relies on (Flux, the registry, Keycloak, ...), and CoreDNS | `polar.dev/pool=services` | |
 
 A pod goes to a dedicated pool by asking for it twice, by the label and by tolerating the taint:
 
@@ -118,7 +117,8 @@ nodeSelector: { polar.dev/pool: writers }
 tolerations: [ { key: polar.dev/pool, operator: Equal, value: writers, effect: NoSchedule } ]
 ```
 
-A pod that asks for no pool runs on `services`, the one worker without a taint. A pod with the selector but not the
+A pod that asks for no pool runs on `services`, the one worker without a taint; so does the cluster's CoreDNS, and a
+cluster needs one such worker. A pod with the selector but not the
 toleration does not run anywhere. The single node (u7s) has no pools, so a workload that selects one belongs on a
 cluster: the selector is for the deployments that target a cluster.
 
@@ -141,10 +141,22 @@ hub's bridge before the node starts, and joined by the node's container (`--netw
 keeps its network. A hub that restarts takes its ends of the veth pairs with it: `just cluster-up` wires the nodes
 again. Every node routes each other node's pod range through that node, so pods reach each other directly, without NAT.
 
-**What differs by role.** `node.dhall` (the control plane, and u7s) and `worker.dhall` take their services from
-`node-common.dhall`: a worker runs containerd, the kubelet and kube-proxy, and its image carries no CoreDNS and no
-cluster bootstrap. A node's identity reaches it in the environment (`NODE_NAME`, `NODE_IP`, `POD_CIDR`); a worker's
-kubelet and kube-proxy have their own certificates, signed by the control plane's CA when it joins.
+**What differs by role.** Each role is an image of its own, made from `node-common.dhall`'s parts, and carries only
+the binaries it runs:
+
+| Role | Image | Runs |
+|------|-------|------|
+| single node (u7s) | `nix-usernetes-node` (`node.dhall`) | everything, with CoreDNS as a static pod |
+| a cluster's control plane | `nix-usernetes-control-plane` (`control-plane.dhall`) | etcd, the apiserver, the controller manager, the scheduler |
+| a cluster's worker | `nix-usernetes-worker` (`worker.dhall`) | containerd, the kubelet, kube-proxy |
+
+A cluster's control plane has no kubelet: like a managed cloud's, it is no Kubernetes node (`kubectl get nodes` lists
+the workers), and no pod can run beside etcd and the cluster's CA, whatever it tolerates. It runs unprivileged. Its
+CoreDNS is a Deployment, which its cluster-bootstrap applies, on a worker without a taint. Without kube-proxy there,
+the apiserver reaches a webhook or an aggregated API at its pods' addresses (`--enable-aggregator-routing`).
+
+A node's identity reaches it in the environment (`NODE_NAME`, `NODE_IP`, `POD_CIDR`); a worker's kubelet and
+kube-proxy have their own certificates, signed by the control plane's CA when it joins.
 
 ## Just targets
 
@@ -159,7 +171,8 @@ kubelet and kube-proxy have their own certificates, signed by the control plane'
 | `just shell` | Open a shell inside the node container |
 | `just logs [service...]` | Follow the services' logs (kept in memory by vigild, the last 5000 lines of each) |
 | `just status` | Show the services' state (`vigil services list`) and the node's pods |
-| `just render` | Render `node.dhall` and `worker.dhall` to `node.nix` and `worker.nix` after changing what a node runs |
+| `just render` | Render `node.dhall`, `control-plane.dhall` and `worker.dhall` to `.nix` after changing what a role runs |
+| `just build-cluster-images` | Build and load a cluster's images (`load-control-plane-image`, `load-worker-image` load one) |
 | `just cluster-up` / `cluster-down` / `cluster-reset` | Start, stop, or wipe the cluster of `cluster.dhall` |
 | `just cluster-init` | Once: the control plane's PKI, the workers joined, labels and taints applied |
 | `just cluster-kubeconfig` / `cluster-status` | Write `./kubeconfig-<cluster>`; show the cluster's containers and nodes |
@@ -169,20 +182,23 @@ kubelet and kube-proxy have their own certificates, signed by the control plane'
 The node is a [nix-container-lib](https://github.com/daveman1010221/nix-container-lib) `System` container: vigild is PID 1 and runs the node's services, with no session (no user, no shell in front, no SSH).
 
 ```
-node-common.dhall                                 what every node has
-├── packages      (a custom layer: containerd, etcd, iproute2, nftables, ...)
+node-common.dhall                                 what nodes are made of
+├── packages      (every node's; a node's that runs pods: containerd, nftables, ...; the control plane's: etcd)
 ├── boot steps    (once at each start: delegate the cgroups, sysctls, the pod masquerade, u7s-prepare)
 └── services      (vigild's: containerd, etcd, kube-apiserver, ..., each running /bin/u7s-<service>)
-node.dhall    →  just render  →  node.nix         the control plane (and u7s): all of the services
-worker.dhall  →  just render  →  worker.nix       a worker: containerd, the kubelet, kube-proxy
+node.dhall           →  just render  →  node.nix            the single node (u7s): all of the services
+control-plane.dhall  →  just render  →  control-plane.nix   a cluster's control plane: etcd, the control plane
+worker.dhall         →  just render  →  worker.nix          a cluster's worker: containerd, the kubelet, kube-proxy
 
 flake.nix                                         what those are made of
 ├── kubernetes  (stdenv.mkDerivation)
 │   ├── src: kubernetes-v1.37.1.tar.gz
-│   └── buildPhase: go build -mod=vendor CGO_ENABLED=0
+│   ├── buildPhase: go build -mod=vendor CGO_ENABLED=0
+│   └── outputs: one per binary (kubectl, kubelet, proxy, apiserver, ...), so each image has only its own
 ├── the services' scripts (/bin/u7s-*), each waiting for what it needs before it starts
-└── nodeImage, workerImage  (nix-container-lib mkContainer, from node.nix and worker.nix)
-    └── the files a node carries: containerd's, the kubelet's and CNI's configuration (the control plane's: CoreDNS)
+└── nodeImage, controlPlaneImage, workerImage  (nix-container-lib mkContainer, from the .nix files)
+    └── the files a role carries: containerd's, the kubelet's and CNI's configuration; CoreDNS (a static pod, or a
+        Deployment and the image to run it)
 ```
 
 After changing a `.dhall` file, run `just render` and commit the `.nix` files with it.
