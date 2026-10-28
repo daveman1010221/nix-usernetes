@@ -183,7 +183,14 @@ cmd_up() {
     local n
     for n in "${NODES[@]}"; do start_node "$n"; done
     echo "Cluster '$CLUSTER' is up."
-    podman exec "$(ctr "$CP")" test -f /etc/kubernetes/admin.conf 2>/dev/null || echo "Next, once: just cluster-init"
+    if ! podman exec "$(ctr "$CP")" test -f /etc/kubernetes/admin.conf 2>/dev/null; then
+        echo "Next, once: just cluster-init"
+        return
+    fi
+    for n in "${WORKERS[@]}"; do
+        podman exec "$(ctr "$n")" test -f /etc/kubernetes/kubelet.conf 2>/dev/null \
+            || { echo "Next: just cluster-init, to join the new nodes"; return; }
+    done
 }
 
 # ── init ─────────────────────────────────────────────────────────────────────────────────────────────────────────────

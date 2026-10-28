@@ -98,7 +98,32 @@ kubectl get nodes -o wide
 ```
 
 `just cluster-down` stops and removes the nodes and keeps their volumes (`u7c-<node>-pki`, `-kubelet`, ...);
-`just cluster-up` brings them back without another init. `just cluster-reset` wipes them.
+`just cluster-up` brings them back without another init. `just cluster-reset` wipes them. To add a node, put it at the
+end of `cluster.dhall`'s list and run `just cluster-up` and `just cluster-init` again: init skips what is done.
+
+**Placement.** `cluster.dhall` lays the cluster out in pools, one worker each, for Polar:
+
+| Node | Runs | Label | Taint |
+|------|------|-------|-------|
+| `cp` | Kubernetes' own (CoreDNS) | | `node-role.kubernetes.io/control-plane:NoSchedule` |
+| `core` | Polar's core: the credentials agent, the cert issuer, cassini | `polar.dev/pool=core` | `polar.dev/pool=core:NoSchedule` |
+| `observers` | the low-trust side: the observers | `polar.dev/pool=observers` | `polar.dev/pool=observers:NoSchedule` |
+| `writers` | the high-trust side: what writes the graph | `polar.dev/pool=writers` | `polar.dev/pool=writers:NoSchedule` |
+| `services` | everything else Polar relies on (Flux, the registry, Keycloak, ...) | `polar.dev/pool=services` | |
+
+A pod goes to a dedicated pool by asking for it twice, by the label and by tolerating the taint:
+
+```yaml
+nodeSelector: { polar.dev/pool: writers }
+tolerations: [ { key: polar.dev/pool, operator: Equal, value: writers, effect: NoSchedule } ]
+```
+
+A pod that asks for no pool runs on `services`, the one worker without a taint. A pod with the selector but not the
+toleration does not run anywhere. The single node (u7s) has no pools, so a workload that selects one belongs on a
+cluster: the selector is for the deployments that target a cluster.
+
+The nodes share this host's kernel: a pool separates workloads by where Kubernetes schedules them, the way they would be
+on separate machines, and is not a security boundary of its own.
 
 **The network.** Rootless podman's bridge networks need iptables extensions (`xt_comment`, `xt_nat`) or nftables'
 `inet` family, which a kernel without IPv6 does not have, so the cluster brings its own, built inside podman's rootless

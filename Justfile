@@ -439,7 +439,8 @@ render:
 cluster-up:
     ./cluster.sh up
 
-# Once, after the first `cluster-up`: the control plane's PKI and kubeconfigs, the workers joined, labels and taints.
+# After the first `cluster-up`: the control plane's PKI and kubeconfigs, the workers joined, labels and taints. Run it
+# again after adding a node to cluster.dhall, or changing labels or taints: it skips what is done.
 cluster-init:
     ./cluster.sh init
 
